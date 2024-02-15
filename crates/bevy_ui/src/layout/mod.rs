@@ -1,8 +1,10 @@
 mod convert;
 pub mod debug;
 
+use crate::{
+    ContentSize, DefaultUiCamera, Measure, Node, NodeMeasure, Outline, Style, TargetCamera, UiScale,
+};
 use bevy_ecs::entity::EntityHashMap;
-use crate::{ContentSize, DefaultUiCamera, Measure, Node, NodeMeasure, Outline, Style, TargetCamera, UiScale};
 use bevy_ecs::{
     change_detection::{DetectChanges, DetectChangesMut},
     entity::Entity,
