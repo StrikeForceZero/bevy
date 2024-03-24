@@ -2,8 +2,10 @@ mod convert;
 pub mod debug;
 
 use crate::{
-    ContentSize, DefaultUiCamera, Measure, Node, NodeMeasure, Outline, Style, TargetCamera, UiScale,
+    ContentSize, DefaultUiCamera, Measure, Node, NodeMeasure, Outline, Style, TargetCamera,
+    UiScale, ViewportUiStyle,
 };
+use bevy_ecs::query::Has;
 use bevy_ecs::{
     change_detection::{DetectChanges, DetectChangesMut},
     entity::{Entity, EntityHashMap},
@@ -51,12 +53,19 @@ struct RootNodePair {
     user_root_node: taffy::NodeId,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct CameraTaffyAndStyle {
+    node_id: taffy::NodeId,
+    viewport_style: Option<taffy::Style>,
+}
+
 #[derive(Resource)]
 pub struct UiSurface {
     entity_to_taffy: EntityHashMap<taffy::NodeId>,
-    camera_entity_to_taffy: EntityHashMap<taffy::NodeId>,
+    camera_entity_to_taffy: EntityHashMap<CameraTaffyAndStyle>,
     camera_roots: EntityHashMap<Vec<RootNodePair>>,
     taffy: TaffyTree<NodeMeasure>,
+    default_viewport_style: ViewportUiStyle,
 }
 
 fn _assert_send_sync_ui_surface_impl_safe() {
@@ -84,11 +93,20 @@ impl Default for UiSurface {
             camera_entity_to_taffy: Default::default(),
             camera_roots: Default::default(),
             taffy,
+            default_viewport_style: Default::default(),
         }
     }
 }
 
 impl UiSurface {
+    pub fn set_default_viewport_style(&mut self, viewport_ui_style: ViewportUiStyle) {
+        self.default_viewport_style = viewport_ui_style;
+    }
+    pub fn from_viewport_style(viewport_ui_style: ViewportUiStyle) -> Self {
+        let mut this = Self::default();
+        this.set_default_viewport_style(viewport_ui_style);
+        this
+    }
     /// Retrieves the Taffy node associated with the given UI node entity and updates its style.
     /// If no associated Taffy node exists a new Taffy node is inserted into the Taffy layout.
     pub fn upsert_node(&mut self, entity: Entity, style: &Style, context: &LayoutContext) {
@@ -102,6 +120,30 @@ impl UiSurface {
         if !added {
             self.taffy
                 .set_style(*taffy_node, convert::from_style(context, style))
+                .unwrap();
+        }
+    }
+
+    fn upsert_camera(&mut self, entity: Entity, style: &Style, context: &LayoutContext) {
+        let mut added = false;
+        let taffy = &mut self.taffy;
+        let camera_taffy_and_style =
+            self.camera_entity_to_taffy
+                .entry(entity)
+                .or_insert_with(|| {
+                    added = true;
+                    CameraTaffyAndStyle {
+                        node_id: taffy.new_leaf(convert::from_style(context, style)).unwrap(),
+                        viewport_style: Some(convert::from_style(context, style)),
+                    }
+                });
+
+        if !added {
+            self.taffy
+                .set_style(
+                    camera_taffy_and_style.node_id,
+                    convert::from_style(context, style),
+                )
                 .unwrap();
         }
     }
@@ -151,24 +193,21 @@ without UI components as a child of an entity with UI components, results may be
         &mut self,
         camera_id: Entity,
         children: impl Iterator<Item = Entity>,
+        layout_context: &LayoutContext,
     ) {
-        let viewport_style = taffy::Style {
-            display: taffy::Display::Grid,
-            // Note: Taffy percentages are floats ranging from 0.0 to 1.0.
-            // So this is setting width:100% and height:100%
-            size: taffy::Size {
-                width: taffy::Dimension::Percent(1.0),
-                height: taffy::Dimension::Percent(1.0),
-            },
-            align_items: Some(taffy::AlignItems::Start),
-            justify_items: Some(taffy::JustifyItems::Start),
-            ..default()
-        };
-
-        let camera_node = *self
-            .camera_entity_to_taffy
-            .entry(camera_id)
-            .or_insert_with(|| self.taffy.new_leaf(viewport_style.clone()).unwrap());
+        let camera_taffy_and_style =
+            self.camera_entity_to_taffy
+                .entry(camera_id)
+                .or_insert_with(|| CameraTaffyAndStyle {
+                    node_id: self
+                        .taffy
+                        .new_leaf(convert::from_style(
+                            layout_context,
+                            &self.default_viewport_style.style(),
+                        ))
+                        .unwrap(),
+                    viewport_style: None,
+                });
         let existing_roots = self.camera_roots.entry(camera_id).or_default();
         let mut new_roots = Vec::new();
         for entity in children {
@@ -183,10 +222,12 @@ without UI components as a child of an entity with UI components, results may be
                         self.taffy.remove_child(previous_parent, node).unwrap();
                     }
 
-                    self.taffy.add_child(camera_node, node).unwrap();
+                    self.taffy
+                        .add_child(camera_taffy_and_style.node_id, node)
+                        .unwrap();
 
                     RootNodePair {
-                        implicit_viewport_node: camera_node,
+                        implicit_viewport_node: camera_taffy_and_style.node_id,
                         user_root_node: node,
                     }
                 });
@@ -239,8 +280,10 @@ without UI components as a child of an entity with UI components, results may be
     /// Removes each camera entity from the internal map and then removes their associated node from taffy
     pub fn remove_camera_entities(&mut self, entities: impl IntoIterator<Item = Entity>) {
         for entity in entities {
-            if let Some(node) = self.camera_entity_to_taffy.remove(&entity) {
-                self.taffy.remove(node).unwrap();
+            if let Some(CameraTaffyAndStyle { node_id, .. }) =
+                self.camera_entity_to_taffy.remove(&entity)
+            {
+                self.taffy.remove(node_id).unwrap();
             }
         }
     }
@@ -299,6 +342,7 @@ pub fn ui_layout_system(
     mut ui_surface: ResMut<UiSurface>,
     root_node_query: Query<(Entity, Option<&TargetCamera>), (With<Node>, Without<Parent>)>,
     style_query: Query<(Entity, Ref<Style>, Option<&TargetCamera>), With<Node>>,
+    viewport_ui_style_query: Query<(Entity, &ViewportUiStyle, Option<&Camera>)>,
     mut measure_query: Query<(Entity, &mut ContentSize)>,
     children_query: Query<(Entity, Ref<Children>), With<Node>>,
     just_children_query: Query<&Children>,
@@ -334,6 +378,12 @@ pub fn ui_layout_system(
             scale_factor: scale_factor * ui_scale.0,
             root_nodes: Vec::new(),
         }
+    };
+    let create_layout_context = |camera_layout_info: &CameraLayoutInfo| {
+        LayoutContext::new(
+            camera_layout_info.scale_factor,
+            [camera_layout_info.size.x as f32, camera_layout_info.size.y as f32].into(),
+        )
     };
 
     // Precalculate the layout info for each camera, so we have fast access to it for each node
@@ -378,10 +428,7 @@ pub fn ui_layout_system(
                 || ui_scale.is_changed()
                 || style.is_changed()
             {
-                let layout_context = LayoutContext::new(
-                    camera.scale_factor,
-                    [camera.size.x as f32, camera.size.y as f32].into(),
-                );
+                let layout_context = create_layout_context(camera);
                 ui_surface.upsert_node(entity, &style, &layout_context);
             }
         }
@@ -404,15 +451,35 @@ pub fn ui_layout_system(
     // clean up removed cameras
     ui_surface.remove_camera_entities(removed_components.removed_cameras.read());
 
+    for (viewport_ui_style_entity, viewport_ui_style, option_camera) in
+        viewport_ui_style_query.iter()
+    {
+        let Some(camera) = option_camera else {
+            warn!("ViewportUiStyle must be set on a Camera entity or using ResMut<UiSurface>.default_viewport_style - ignoring {viewport_ui_style_entity:?}");
+            continue;
+        };
+        let camera_entity = viewport_ui_style_entity;
+        let mut camera_layout_info_map = &mut camera_layout_info;
+        let camera_layout_info = camera_layout_info_map
+            .entry(camera_entity)
+            .or_insert_with(|| calculate_camera_layout_info(camera));
+        let layout_context = create_layout_context(camera_layout_info);
+        ui_surface.upsert_camera(camera_entity, viewport_ui_style.style(), &layout_context)
+    }
+
     // update camera children
-    for (camera_id, _) in cameras.iter() {
-        let root_nodes =
-            if let Some(CameraLayoutInfo { root_nodes, .. }) = camera_layout_info.get(&camera_id) {
-                root_nodes.iter().cloned()
+    for (camera_id, camera) in cameras.iter() {
+        let mut camera_layout_infos = &mut camera_layout_info;
+        let (layout_context, root_nodes) = {
+            let (camera_layout_info, root_nodes) = if let Some(camera_layout_info) = camera_layout_infos.get(&camera_id) {
+                (camera_layout_info, camera_layout_info.root_nodes.iter().cloned())
             } else {
-                [].iter().cloned()
+                let camera_layout_info = camera_layout_infos.entry(camera_id).or_insert_with(|| calculate_camera_layout_info(camera));
+                (&*camera_layout_info, [].iter().cloned())
             };
-        ui_surface.set_camera_children(camera_id, root_nodes);
+            (create_layout_context(camera_layout_info), root_nodes)
+        };
+        ui_surface.set_camera_children(camera_id, root_nodes, &layout_context);
     }
 
     // update and remove children

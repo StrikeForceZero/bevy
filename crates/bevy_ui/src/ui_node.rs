@@ -2109,6 +2109,36 @@ mod tests {
     }
 }
 
+
+#[derive(Component, Clone, Debug, Reflect, PartialEq)]
+pub struct ViewportUiStyle(Style);
+
+impl ViewportUiStyle {
+    pub fn style(&self) -> &Style {
+        &self.0
+    }
+    pub fn from_defaults<F>(map: F) -> Self
+        where F: FnOnce(&mut Style)
+    {
+        let mut this = Self::default();
+        map(&mut this.0);
+        this
+    }
+}
+
+impl Default for ViewportUiStyle {
+    fn default() -> Self {
+        ViewportUiStyle(Style {
+            display: Display::Block,
+            width: Val::Percent(100.),
+            height: Val::Percent(100.),
+            align_items: AlignItems::Start,
+            justify_items: JustifyItems::Start,
+            ..Default::default()
+        })
+    }
+}
+
 /// Indicates that this root [`Node`] entity should be rendered to a specific camera.
 /// UI then will be laid out respecting the camera's viewport and scale factor, and
 /// rendered to this camera's [`bevy_render::camera::RenderTarget`].
