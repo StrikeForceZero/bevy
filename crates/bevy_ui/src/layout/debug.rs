@@ -1,37 +1,41 @@
-use crate::UiSurface;
 use bevy_ecs::prelude::Entity;
 use bevy_utils::HashMap;
 use std::fmt::Write;
 use taffy::prelude::Node;
-use taffy::tree::LayoutTree;
+use taffy::prelude::LayoutTree;
+use crate::ui_surface::UiSurface;
 
 /// Prints a debug representation of the computed layout of the UI layout tree for each window.
 pub fn print_ui_layout_tree(ui_surface: &UiSurface) {
     let taffy_to_entity: HashMap<Node, Entity> = ui_surface
-        .entity_to_taffy
+        .ui_node_meta
         .iter()
-        .map(|(entity, node)| (*node, *entity))
-        .collect();
-    let mut camera_tree_output_map = HashMap::<Entity, Vec<String>>::new();
-    for (&(camera_entity, _), root_node_pair) in ui_surface.camera_and_root_node_pair.iter() {
-        let mut out = String::new();
-        print_node(
-            ui_surface,
-            &taffy_to_entity,
-            camera_entity,
-            root_node_pair.implicit_viewport_node,
-            false,
-            String::new(),
-            &mut out,
-        );
-        camera_tree_output_map
-            .entry(camera_entity)
-            .or_default()
-            .push(out);
-    }
-    for (camera_entity, tree_strings) in camera_tree_output_map.into_iter() {
-        let output = tree_strings.join("\n");
-        bevy_utils::tracing::info!("Layout tree for camera entity: {camera_entity:?}\n{output}");
+        .map(|(&ui_entity, meta)| (meta.root_node_pair.user_root_node, ui_entity))
+        .collect::<HashMap<Node, Entity>>();
+    for (&camera_entity, root_node_set) in ui_surface.camera_to_ui_set.iter() {
+        for &root_node_entity in root_node_set.iter() {
+            let Some(implicit_viewport_node) = ui_surface
+                .ui_node_meta
+                .get(&root_node_entity)
+                .map(|meta| meta.root_node_pair.implicit_viewport_node)
+            else {
+                continue;
+            };
+            let mut out = String::new();
+            print_node(
+                ui_surface,
+                &taffy_to_entity,
+                camera_entity,
+                implicit_viewport_node,
+                false,
+                String::new(),
+                &mut out,
+            );
+            
+            bevy_utils::tracing::info!(
+                "Layout tree for camera entity: {camera_entity:?}\n{out}"
+            );
+        }
     }
 }
 
