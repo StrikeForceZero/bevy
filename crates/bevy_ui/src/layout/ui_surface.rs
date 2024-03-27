@@ -121,16 +121,40 @@ impl UiSurface {
         if added {
             //
         } else {
+            let option_old_camera_entity = ui_node_meta.camera_entity.replace(camera_entity);
             // if we didn't insert, lets check to make the camera reference is the same
-            if Some(camera_entity) != ui_node_meta.camera_entity.replace(camera_entity) {
-                // camera reference is not the same so remove it from the old set
-                if let Some(root_node_set) = self
-                    .camera_to_ui_set
-                    .get_mut(&ui_node_meta.camera_entity.unwrap())
-                {
-                    root_node_set.remove(&root_node_entity);
+            if Some(camera_entity) != option_old_camera_entity {
+                if let Some(old_camera_entity) = option_old_camera_entity {
+                    // camera reference is not the same so remove it from the old set
+                    if let Some(root_node_set) = self.camera_to_ui_set.get_mut(&old_camera_entity) {
+                        root_node_set.remove(&root_node_entity);
+                    }
+                }
+
+                if false {
+                    self.camera_to_ui_set
+                        .entry(camera_entity)
+                        .or_default()
+                        .insert(root_node_entity);
+
+                    if let Some(parent) = self
+                        .taffy
+                        .parent(ui_node_meta.root_node_pair.user_root_node)
+                    {
+                        self.taffy
+                            .remove_child(parent, ui_node_meta.root_node_pair.user_root_node)
+                            .unwrap();
+                    }
+
+                    self.taffy
+                        .add_child(
+                            ui_node_meta.root_node_pair.implicit_viewport_node,
+                            ui_node_meta.root_node_pair.user_root_node,
+                        )
+                        .unwrap();
                 }
             }
+
             self.taffy
                 .set_style(
                     ui_node_meta.root_node_pair.user_root_node,
@@ -271,14 +295,30 @@ without UI components as a child of an entity with UI components, results may be
         }
     }
 
+    fn reset_relationship(&mut self, root_node_entity: &Entity) {
+        self.clear_relationship(root_node_entity);
+        if let Some(ui_meta) = self.ui_node_meta.get(root_node_entity) {
+            self.taffy.add_child(ui_meta.root_node_pair.implicit_viewport_node, ui_meta.root_node_pair.implicit_viewport_node).unwrap();
+        }
+    }
+
+    fn clear_relationship(&mut self, root_node_entity: &Entity) {
+        if let Some(ui_meta) = self.ui_node_meta.get(root_node_entity) {
+            if let Some(parent) = self.taffy.parent(ui_meta.root_node_pair.user_root_node) {
+                self.taffy.remove_child(parent, ui_meta.root_node_pair.user_root_node).unwrap();
+            }
+        }
+    }
+
     /// Set the ui node entities without a [`Parent`] as children to the root node in the taffy layout.
     pub fn set_camera_children(
         &mut self,
         camera_entity: Entity,
         children: impl Iterator<Item = Entity> + Debug,
     ) {
-        //let removed_children = self.camera_to_ui_set.get(&camera_entity).unwrap();
-        //let mut removed_children = removed_children.clone();
+        // self.camera_to_ui_set.entry(camera_entity).or_default().clear();
+        let removed_children = self.camera_to_ui_set.entry(camera_entity).or_default();
+        let mut removed_children = removed_children.clone();
 
         for ui_entity in children {
             let Some(ui_meta) = self.ui_node_meta.get_mut(&ui_entity) else {
@@ -286,17 +326,35 @@ without UI components as a child of an entity with UI components, results may be
             };
             ui_meta.camera_entity = Some(camera_entity);
 
+            // fix taffy relationships
+            {
+                if let Some(parent) = self.taffy.parent(ui_meta.root_node_pair.user_root_node) {
+                    self.taffy
+                        .remove_child(parent, ui_meta.root_node_pair.user_root_node)
+                        .unwrap();
+                }
+
+                self.taffy
+                    .add_child(
+                        ui_meta.root_node_pair.implicit_viewport_node,
+                        ui_meta.root_node_pair.user_root_node,
+                    )
+                    .unwrap();
+            }
+
             self.camera_to_ui_set
                 .entry(camera_entity)
                 .or_default()
                 .insert(ui_entity);
-            // removed_children.remove(&ui_entity);
+            removed_children.remove(&ui_entity);
         }
 
-        // for orphan in removed_children {
-        //     self.mark_ui_node_as_orphaned(&orphan);
-        //     // self.remove_root_node(&orphan);
-        // }
+       for orphan in removed_children {
+           if let Some(ui_meta) = self.ui_node_meta.get_mut(&orphan) {
+               self.taffy.remove(ui_meta.root_node_pair.implicit_viewport_node).unwrap();
+               ui_meta.root_node_pair.implicit_viewport_node = self.taffy.new_leaf(default_viewport_style()).unwrap();
+           }
+       }
     }
 
     /// Compute the layout for each window entity's corresponding root node in the layout.
@@ -574,7 +632,10 @@ mod tests {
             .unwrap()
             .contains(&child_entity));
 
+        let copy = child_entities.clone();
         ui_surface.set_camera_children(camera_entity, child_entities.into_iter());
+        println!("{root_node_entity:?} vs {child_entity:?} ======  {copy:?}   ====== {:?}", ui_surface
+            .camera_to_ui_set);
         assert!(!ui_surface
             .camera_to_ui_set
             .get(&camera_entity)
