@@ -22,6 +22,8 @@ use bevy_utils::{HashMap, HashSet};
 use bevy_window::{PrimaryWindow, Window, WindowScaleFactorChanged};
 use thiserror::Error;
 use bevy_ecs::entity::EntityHashSet;
+use bevy_ecs::query::Has;
+use crate::debug::print_ui_layout_tree;
 
 #[derive(Debug)]
 pub struct LayoutContext {
@@ -71,7 +73,7 @@ pub fn ui_layout_system(
     mut resize_events: EventReader<bevy_window::WindowResized>,
     mut ui_surface: ResMut<UiSurface>,
     root_node_query: Query<(Entity, Option<&TargetCamera>), (With<Node>, Without<Parent>)>,
-    style_query: Query<(Entity, Ref<Style>, Option<&TargetCamera>), With<Node>>,
+    style_query: Query<(Entity, Ref<Style>, Option<&TargetCamera>, Has<Parent>), With<Node>>,
     mut measure_query: Query<(Entity, &mut ContentSize)>,
     children_query: Query<(Entity, Ref<Children>), With<Node>>,
     just_children_query: Query<&Children>,
@@ -142,7 +144,7 @@ pub fn ui_layout_system(
     }
 
     // Resize all nodes
-    for (entity, style, target_camera) in style_query.iter() {
+    for (entity, style, target_camera, has_parent) in style_query.iter() {
         if let Some((camera_entity, camera)) = camera_with_default(target_camera)
             .and_then(|c| camera_layout_info.get(&c).map(|clo| (c, clo)))
         {
@@ -155,7 +157,7 @@ pub fn ui_layout_system(
                     camera.scale_factor,
                     [camera.size.x as f32, camera.size.y as f32].into(),
                 );
-                ui_surface.upsert_node(camera_entity, entity, &style, &layout_context);
+                ui_surface.upsert_node(camera_entity, entity, &style, &layout_context, has_parent);
             }
         }
     }
@@ -268,13 +270,14 @@ pub fn ui_layout_system(
     if *total_nodes != ui_surface.taffy.total_node_count() {
         *total_nodes = ui_surface.taffy.total_node_count();
         println!("total_nodes: {:?}", *total_nodes);
-        for (entity, ui_meta) in ui_surface.ui_node_meta.iter() {
+        for (entity, ui_meta) in ui_surface.ui_root_node_meta.iter() {
             let camera_entity_string = ui_meta.camera_entity.map_or("None".to_string(), |v| v.to_string());
             let user_root_node = ui_meta.root_node_pair.user_root_node;
             let implicit_viewport_node = ui_meta.root_node_pair.implicit_viewport_node;
             let children = ui_surface.taffy.child_count(user_root_node).unwrap();
             println!("entity: {entity}, camera: {camera_entity_string}, root_node: {user_root_node:?}, viewport: {implicit_viewport_node:?}, children: {children}");
         }
+        print_ui_layout_tree(&ui_surface, |s| println!("{s}"));
     }
 }
 
@@ -469,7 +472,7 @@ mod tests {
 
         // no UI entities in world, none in UiSurface
         let ui_surface = world.resource::<UiSurface>();
-        assert!(ui_surface.ui_node_meta.is_empty());
+        assert!(ui_surface.ui_root_node_meta.is_empty());
 
         let ui_entity = world.spawn(NodeBundle::default()).id();
 
@@ -477,8 +480,8 @@ mod tests {
         ui_schedule.run(&mut world);
 
         let ui_surface = world.resource::<UiSurface>();
-        assert!(ui_surface.ui_node_meta.contains_key(&ui_entity));
-        assert_eq!(ui_surface.ui_node_meta.len(), 1);
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity));
+        assert_eq!(ui_surface.ui_root_node_meta.len(), 1);
 
         world.despawn(ui_entity);
 
@@ -486,8 +489,8 @@ mod tests {
         ui_schedule.run(&mut world);
 
         let ui_surface = world.resource::<UiSurface>();
-        assert!(!ui_surface.ui_node_meta.contains_key(&ui_entity));
-        assert!(ui_surface.ui_node_meta.is_empty());
+        assert!(!ui_surface.ui_root_node_meta.contains_key(&ui_entity));
+        assert!(ui_surface.ui_root_node_meta.is_empty());
     }
 
     #[test]
@@ -507,7 +510,7 @@ mod tests {
 
         // no UI entities in world, none in UiSurface
         let ui_surface = world.resource::<UiSurface>();
-        assert!(ui_surface.ui_node_meta.is_empty());
+        assert!(ui_surface.ui_root_node_meta.is_empty());
 
         // respawn camera
         let camera_entity = world.spawn(Camera2dBundle::default()).id();
@@ -520,8 +523,8 @@ mod tests {
         ui_schedule.run(&mut world);
 
         let ui_surface = world.resource::<UiSurface>();
-        assert!(ui_surface.ui_node_meta.contains_key(&ui_entity));
-        assert_eq!(ui_surface.ui_node_meta.len(), 1);
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity));
+        assert_eq!(ui_surface.ui_root_node_meta.len(), 1);
 
         world.despawn(ui_entity);
         world.despawn(camera_entity);
@@ -530,8 +533,8 @@ mod tests {
         ui_schedule.run(&mut world);
 
         let ui_surface = world.resource::<UiSurface>();
-        assert!(!ui_surface.ui_node_meta.contains_key(&ui_entity));
-        assert!(ui_surface.ui_node_meta.is_empty());
+        assert!(!ui_surface.ui_root_node_meta.contains_key(&ui_entity));
+        assert!(ui_surface.ui_root_node_meta.is_empty());
     }
 
     #[test]
@@ -547,7 +550,7 @@ mod tests {
         // retrieve the ui node corresponding to `ui_entity` from ui surface
         let ui_surface = world.resource::<UiSurface>();
         let ui_node = *ui_surface
-            .get_root_node_taffy_node(&ui_entity)
+            .entity_to_taffy.get(&ui_entity)
             .expect("missing root node pair");
 
         world.despawn(ui_entity);
@@ -572,10 +575,7 @@ mod tests {
         ui_schedule.run(&mut world);
 
         let ui_surface = world.resource::<UiSurface>();
-        let ui_parent_node = ui_surface
-            .get_root_pair_node(&ui_parent_entity)
-            .expect("missing root node pair")
-            .user_root_node;
+        let ui_parent_node = ui_surface.entity_to_taffy[&ui_parent_entity];
 
         // `ui_parent_node` shouldn't have any children yet
         assert_eq!(ui_surface.taffy.child_count(ui_parent_node).unwrap(), 0);
@@ -592,19 +592,8 @@ mod tests {
 
         // `ui_parent_node` should have children now
         let ui_surface = world.resource::<UiSurface>();
-        let camera_entity = ui_surface
-            .ui_node_meta
-            .get(&ui_parent_entity)
-            .unwrap()
-            .camera_entity
-            .unwrap();
-
         assert_eq!(
-            ui_surface
-                .camera_to_ui_set
-                .get(&camera_entity)
-                .unwrap()
-                .len(),
+            ui_surface.entity_to_taffy.len(),
             1 + ui_child_entities.len()
         );
         assert_eq!(
@@ -612,14 +601,11 @@ mod tests {
             ui_child_entities.len()
         );
 
-        let child_node_map = HashMap::from_iter(ui_child_entities.iter().map(|child_entity| {
-            (
-                *child_entity,
-                *ui_surface
-                    .get_root_node_taffy_node(child_entity)
-                    .expect("missing root node pair"),
-            )
-        }));
+        let child_node_map = HashMap::from_iter(
+            ui_child_entities
+                .iter()
+                .map(|child_entity| (*child_entity, ui_surface.entity_to_taffy[child_entity])),
+        );
 
         // the children should have a corresponding ui node and that ui node's parent should be `ui_parent_node`
         for node in child_node_map.values() {
@@ -637,18 +623,8 @@ mod tests {
         ui_schedule.run(&mut world);
 
         let ui_surface = world.resource::<UiSurface>();
-        let camera_entity = ui_surface
-            .ui_node_meta
-            .get(&ui_parent_entity)
-            .unwrap()
-            .camera_entity
-            .unwrap();
         assert_eq!(
-            ui_surface
-                .camera_to_ui_set
-                .get(&camera_entity)
-                .unwrap()
-                .len(),
+            ui_surface.entity_to_taffy.len(),
             1 + ui_child_entities.len()
         );
         assert_eq!(
@@ -659,12 +635,7 @@ mod tests {
         // the remaining children should still have nodes in the layout tree
         for child_entity in &ui_child_entities {
             let child_node = child_node_map[child_entity];
-            assert_eq!(
-                *ui_surface
-                    .get_root_node_taffy_node(child_entity)
-                    .expect("missing root node pair"),
-                child_node
-            );
+            assert_eq!(ui_surface.entity_to_taffy[child_entity], child_node);
             assert_eq!(ui_surface.taffy.parent(child_node), Some(ui_parent_node));
             assert!(ui_surface
                 .taffy
@@ -675,7 +646,9 @@ mod tests {
 
         // the nodes of the deleted children should have been removed from the layout tree
         for deleted_child_entity in &deleted_children {
-            assert!(!ui_surface.ui_node_meta.contains_key(deleted_child_entity));
+            assert!(!ui_surface
+                .entity_to_taffy
+                .contains_key(deleted_child_entity));
             let deleted_child_node = child_node_map[deleted_child_entity];
             assert!(!ui_surface
                 .taffy
@@ -691,7 +664,7 @@ mod tests {
 
         // all nodes should have been deleted
         let ui_surface = world.resource::<UiSurface>();
-        assert!(ui_surface.ui_node_meta.is_empty());
+        assert!(ui_surface.entity_to_taffy.is_empty());
         assert_eq!(ui_surface.taffy.total_node_count(), 0);
     }
 
@@ -968,7 +941,7 @@ mod tests {
 
         let ui_surface = world.resource::<UiSurface>();
         let ui_node = *ui_surface
-            .get_root_node_taffy_node(&ui_entity)
+            .entity_to_taffy.get(&ui_entity)
             .expect("missing root node pair");
 
         // a node with a content size needs to be measured
@@ -1559,7 +1532,7 @@ mod tests {
 
         let ui_surface = instance.world.get_resource::<UiSurface>().unwrap();
 
-        let highest_node = ui_surface.ui_node_meta.iter().fold(Option::<taffy::node::Node>::None, |option_highest, (_, next_meta)| {
+        let highest_node = ui_surface.ui_root_node_meta.iter().fold(Option::<taffy::node::Node>::None, |option_highest, (_, next_meta)| {
             let mut cur_highest = option_highest.unwrap_or(next_meta.root_node_pair.implicit_viewport_node);
             if cur_highest < next_meta.root_node_pair.implicit_viewport_node {
                 cur_highest = next_meta.root_node_pair.implicit_viewport_node;
@@ -1572,17 +1545,15 @@ mod tests {
 
         ui_schedule.run(instance.world);
         let ui_surface = instance.world.get_resource::<UiSurface>().unwrap();
-        for (_entity, ui_meta) in ui_surface.ui_node_meta.iter() {
-            assert!(ui_meta.root_node_pair.implicit_viewport_node <= highest_node, "extraneous taffy nodes are being created last known highest: {highest_node:?}, encountered (implicit_viewport_node): {:?}", ui_meta.root_node_pair.implicit_viewport_node);
-            assert!(ui_meta.root_node_pair.user_root_node <= highest_node, "extraneous taffy nodes are being created last known highest: {highest_node:?}, encountered (user_root_node): {:?}", ui_meta.root_node_pair.user_root_node);
+        for (entity, &node) in ui_surface.entity_to_taffy.iter() {
+            assert!(node <= highest_node, "extraneous taffy nodes are being created last known highest: {highest_node:?}, encountered ({entity}): {:?}", node);
         }
         instance.world.commands().entity(instance.initial.ui_right_1).insert(TargetCamera(instance.initial.cameras.left));
 
         ui_schedule.run(instance.world);
         let ui_surface = instance.world.get_resource::<UiSurface>().unwrap();
-        for (_entity, ui_meta) in ui_surface.ui_node_meta.iter() {
-            assert!(ui_meta.root_node_pair.implicit_viewport_node <= highest_node, "extraneous taffy nodes are being created last known highest: {highest_node:?}, encountered (implicit_viewport_node): {:?}", ui_meta.root_node_pair.implicit_viewport_node);
-            assert!(ui_meta.root_node_pair.user_root_node <= highest_node, "extraneous taffy nodes are being created last known highest: {highest_node:?}, encountered (user_root_node): {:?}", ui_meta.root_node_pair.user_root_node);
+        for (entity, &node) in ui_surface.entity_to_taffy.iter() {
+            assert!(node <= highest_node, "extraneous taffy nodes are being created last known highest: {highest_node:?}, encountered ({entity}): {:?}", node);
         }
     }
 }

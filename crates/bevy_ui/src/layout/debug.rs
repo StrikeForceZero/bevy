@@ -6,16 +6,19 @@ use taffy::prelude::LayoutTree;
 use crate::ui_surface::UiSurface;
 
 /// Prints a debug representation of the computed layout of the UI layout tree for each window.
-pub fn print_ui_layout_tree(ui_surface: &UiSurface) {
+pub fn print_ui_layout_tree<F: Fn(String)>(ui_surface: &UiSurface, log_fn: F) {
     let taffy_to_entity: HashMap<Node, Entity> = ui_surface
-        .ui_node_meta
+        .entity_to_taffy
         .iter()
-        .map(|(&ui_entity, meta)| (meta.root_node_pair.user_root_node, ui_entity))
+        .map(|(&ui_entity, &taffy_node)| (taffy_node, ui_entity))
         .collect::<HashMap<Node, Entity>>();
-    for (&camera_entity, root_node_set) in ui_surface.camera_to_ui_set.iter() {
+    for (&camera_entity, root_node_set) in ui_surface.camera_root_nodes.iter() {
+        log_fn(format!(
+            "Layout tree for camera entity: {camera_entity}"
+        ));
         for &root_node_entity in root_node_set.iter() {
             let Some(implicit_viewport_node) = ui_surface
-                .ui_node_meta
+                .ui_root_node_meta
                 .get(&root_node_entity)
                 .map(|meta| meta.root_node_pair.implicit_viewport_node)
             else {
@@ -31,10 +34,8 @@ pub fn print_ui_layout_tree(ui_surface: &UiSurface) {
                 String::new(),
                 &mut out,
             );
-            
-            bevy_utils::tracing::info!(
-                "Layout tree for camera entity: {camera_entity:?}\n{out}"
-            );
+
+            log_fn(out);
         }
     }
 }
@@ -69,7 +70,7 @@ fn print_node(
     };
     writeln!(
         acc,
-        "{lines}{fork} {display} [x: {x:<4} y: {y:<4} width: {width:<4} height: {height:<4}] ({entity:?}) {measured}",
+        "{lines}{fork} {display} [x: {x:<4} y: {y:<4} width: {width:<4} height: {height:<4}] ({entity}) {measured}",
         lines = lines_string,
         fork = fork_string,
         display = display_variant,
