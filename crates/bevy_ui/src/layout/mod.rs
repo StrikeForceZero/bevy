@@ -519,17 +519,17 @@ mod tests {
             .spawn((NodeBundle::default(), TargetCamera(camera_entity)))
             .id();
 
-        // `ui_layout_system` should create a  keypair (`camera_entity`, `root_node_entity`) in `UiSurface::camera_root_to_viewport_taffy`
+        // `ui_layout_system` should populate `UiSurface::entity_to_taffy`, `UiSurface::ui_root_node_meta`, and `UiSurface::camera_root_nodes`
         ui_schedule.run(&mut world);
 
         let ui_surface = world.resource::<UiSurface>();
         assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity));
         assert_eq!(ui_surface.ui_root_node_meta.len(), 1);
 
-        world.despawn(ui_entity);
+        // world.despawn(ui_entity);
         world.despawn(camera_entity);
 
-        // `ui_layout_system` should remove (`camera_entity`, _) from `UiSurface::camera_root_to_viewport_taffy`
+        // `ui_layout_system` should remove camera from `UiSurface::camera_root_nodes`
         ui_schedule.run(&mut world);
 
         let ui_surface = world.resource::<UiSurface>();

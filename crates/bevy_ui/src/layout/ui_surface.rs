@@ -116,28 +116,8 @@ impl UiSurface {
         }
     }
 
-    pub(super) fn get_root_pair_node(&self, root_node_entity: &Entity) -> Option<&RootNodePair> {
-        self.ui_root_node_meta
-            .get(root_node_entity)
-            .map(|meta| &meta.root_node_pair)
-    }
-
-    pub(super) fn get_root_node_taffy_node(
-        &self,
-        root_node_entity: &Entity,
-    ) -> Option<&taffy::node::Node> {
-        self.get_root_pair_node(root_node_entity)
-            .map(|rnp| &rnp.user_root_node)
-    }
-
-    pub(super) fn get_root_node_viewport_node(
-        &self,
-        root_node_entity: &Entity,
-    ) -> Option<&taffy::node::Node> {
-        self.get_root_pair_node(root_node_entity)
-            .map(|rnp| &rnp.implicit_viewport_node)
-    }
-
+    /// Disassociates the camera from all of its assigned root nodes and removes their viewport nodes
+    /// Removes entry in camera_root_nodes
     pub(super) fn remove_camera(&mut self, camera_entity: &Entity) {
         if let Some(root_node_entities) = self.camera_root_nodes.remove(camera_entity) {
             for root_node_entity in root_node_entities {
@@ -146,6 +126,8 @@ impl UiSurface {
         };
     }
 
+    /// Disassociates the root node from the assigned camera (if any) and removes the viewport node from taffy
+    /// Removes entry in ui_root_node_meta
     pub(super) fn remove_root_node_viewport(&mut self, ui_root_node_entity: &Entity) {
         if let Some(mut removed) = self.ui_root_node_meta.remove(ui_root_node_entity) {
             if let Some(camera_entity) = removed.camera_entity.take() {
@@ -157,10 +139,15 @@ impl UiSurface {
         }
     }
 
+    /// Removes the ui node from the taffy tree, and if it's a root node it also calls remove_root_node_viewport
     pub(super) fn remove_ui_node(&mut self, ui_node_entity: &Entity) {
         self.remove_root_node_viewport(ui_node_entity);
         if let Some(taffy_node) = self.entity_to_taffy.remove(ui_node_entity) {
             self.taffy.remove(taffy_node).unwrap();
+        }
+        // remove root node entry if this is a root node
+        if self.ui_root_node_meta.contains_key(ui_node_entity) {
+            self.remove_root_node_viewport(ui_node_entity);
         }
     }
 
@@ -538,26 +525,6 @@ mod tests {
             &ui_surface.taffy,
             &meta.root_node_pair
         ));
-    }
-
-    #[test]
-    fn test_get_root_pair_node() {
-        let mut ui_surface = UiSurface::default();
-        let camera_entity = Entity::from_raw(0);
-        let root_node_entity = Entity::from_raw(1);
-
-        assert_eq!(ui_surface.get_root_pair_node(&root_node_entity), None);
-
-        let style = Style::default();
-        ui_surface.upsert_node(
-            camera_entity,
-            root_node_entity,
-            &style,
-            &DUMMY_LAYOUT_CONTEXT,
-            false,
-        );
-
-        assert!(ui_surface.get_root_pair_node(&root_node_entity).is_some());
     }
 
     #[test]
