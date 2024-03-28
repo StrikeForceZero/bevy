@@ -1347,7 +1347,8 @@ mod tests {
                 assert_eq!(n.logical_rect(g).shift_by(right_rect), right_rect.split_half(SplitHalfAxis::Y).1.split_half(SplitHalfAxis::Y).1, "{label} not in expected bounds");
             });
 
-
+            // each root node creates an extra implicit viewport node, so we need to account for those
+            let root_node_count = self.world.query_filtered::<&Node, Without<Parent>>().iter(self.world).len();
 
             // loosely validate taffy state (node count)
             let left = vec![
@@ -1365,16 +1366,15 @@ mod tests {
             let mut all_items = left.clone();
             all_items.append(&mut right.clone());
 
-            const NODES_PER_ITEM: usize = 2;
 
-            let total_node_count = all_items.len() * NODES_PER_ITEM;
-            let nodes_alive_count = all_items.iter().fold(0, |sum, item| sum + item.is_some() as usize) * NODES_PER_ITEM;
+            let total_node_count = all_items.len() + root_node_count;
+            let nodes_alive_count = all_items.iter().fold(0, |sum, item| sum + item.is_some() as usize) + root_node_count;
             let mut expected_node_count_negative_offset = 0;
             if self.state.cameras.left.is_none() {
-                expected_node_count_negative_offset += left.len() * NODES_PER_ITEM;
+                expected_node_count_negative_offset += left.len();
             }
             if self.state.cameras.right.is_none() {
-                expected_node_count_negative_offset += right.len() * NODES_PER_ITEM;
+                expected_node_count_negative_offset += right.len();
             }
 
             let expected_node_count = (total_node_count - expected_node_count_negative_offset).min(nodes_alive_count);
@@ -1532,13 +1532,10 @@ mod tests {
 
         let ui_surface = instance.world.get_resource::<UiSurface>().unwrap();
 
-        let highest_node = ui_surface.ui_root_node_meta.iter().fold(Option::<taffy::node::Node>::None, |option_highest, (_, next_meta)| {
-            let mut cur_highest = option_highest.unwrap_or(next_meta.root_node_pair.implicit_viewport_node);
-            if cur_highest < next_meta.root_node_pair.implicit_viewport_node {
-                cur_highest = next_meta.root_node_pair.implicit_viewport_node;
-            }
-            if cur_highest < next_meta.root_node_pair.user_root_node {
-                cur_highest = next_meta.root_node_pair.user_root_node;
+        let highest_node = ui_surface.entity_to_taffy.iter().fold(Option::<taffy::node::Node>::None, |option_highest, (_, &next_node)| {
+            let mut cur_highest = option_highest.unwrap_or(next_node);
+            if cur_highest < next_node {
+                cur_highest = next_node;
             }
             Some(cur_highest)
         }).expect("nothing in scene");

@@ -655,7 +655,6 @@ mod tests {
         let camera_entity = Entity::from_raw(0);
         let root_node_entity = Entity::from_raw(1);
         let child_entity = Entity::from_raw(2);
-        let child_entities = vec![child_entity];
         let style = Style::default();
 
         ui_surface.upsert_node(
@@ -666,31 +665,67 @@ mod tests {
             false,
         );
         ui_surface.upsert_node(camera_entity, child_entity, &style, &DUMMY_LAYOUT_CONTEXT, true);
-        assert!(ui_surface
-            .camera_root_nodes
-            .get(&camera_entity)
-            .unwrap()
-            .contains(&root_node_entity));
-        assert!(ui_surface
-            .camera_root_nodes
-            .get(&camera_entity)
-            .unwrap()
-            .contains(&child_entity));
 
-        let copy = child_entities.clone();
-        ui_surface.set_camera_children(camera_entity, child_entities.into_iter());
-        println!("{root_node_entity:?} vs {child_entity:?} ======  {copy:?}   ====== {:?}", ui_surface
-            .camera_root_nodes);
+        let root_taffy_node = ui_surface.ui_root_node_meta.get(&root_node_entity).unwrap().root_node_pair.user_root_node;
+        let child_taffy = ui_surface.entity_to_taffy.get(&child_entity).unwrap();
+        // set up the relationship manually
+        ui_surface.taffy.add_child(root_taffy_node, *child_taffy).unwrap();
+
+        assert!(ui_surface
+            .camera_root_nodes
+            .get(&camera_entity)
+            .unwrap()
+            .contains(&root_node_entity), "root node not associated with camera");
         assert!(!ui_surface
             .camera_root_nodes
             .get(&camera_entity)
             .unwrap()
-            .contains(&root_node_entity));
+            .contains(&child_entity), "child of root node should not be associated with camera");
+
+        let root_taffy_node = ui_surface.ui_root_node_meta.get(&root_node_entity).unwrap().root_node_pair.user_root_node;
+        let child_taffy = ui_surface.entity_to_taffy.get(&child_entity).unwrap();
+        let root_taffy_children = ui_surface.taffy.children(root_taffy_node).unwrap();
+        assert!(root_taffy_children.contains(child_taffy), "root node children do not contain: {child_taffy:?}");
+        assert_eq!(ui_surface.taffy.child_count(root_taffy_node).unwrap(), 1, "expected root node child count to be 1");
+
+        ui_surface.set_camera_children(camera_entity, Vec::<Entity>::new().into_iter());
+
+        assert!(!ui_surface
+            .camera_root_nodes
+            .get(&camera_entity)
+            .unwrap()
+            .contains(&root_node_entity), "root node should have been unassociated with camera");
+        assert!(!ui_surface
+            .camera_root_nodes
+            .get(&camera_entity)
+            .unwrap()
+            .contains(&child_entity), "child of root node should not be associated with camera");
+
+        let root_taffy_node = ui_surface.ui_root_node_meta.get(&root_node_entity).unwrap().root_node_pair.user_root_node;
+        let child_taffy = ui_surface.entity_to_taffy.get(&child_entity).unwrap();
+        let root_taffy_children = ui_surface.taffy.children(root_taffy_node).unwrap();
+        assert!(root_taffy_children.contains(child_taffy), "root node children do not contain: {child_taffy:?}");
+        assert_eq!(ui_surface.taffy.child_count(root_taffy_node).unwrap(), 1, "expected root node child count to be 1");
+
+        ui_surface.set_camera_children(camera_entity, vec![root_node_entity].into_iter());
+
+
         assert!(ui_surface
             .camera_root_nodes
             .get(&camera_entity)
             .unwrap()
-            .contains(&child_entity));
+            .contains(&root_node_entity), "root node should have been re-associated with camera");
+        assert!(!ui_surface
+            .camera_root_nodes
+            .get(&camera_entity)
+            .unwrap()
+            .contains(&child_entity), "child of root node should not be associated with camera");
+
+        let root_taffy_node = ui_surface.ui_root_node_meta.get(&root_node_entity).unwrap().root_node_pair.user_root_node;
+        let child_taffy = ui_surface.entity_to_taffy.get(&child_entity).unwrap();
+        let root_taffy_children = ui_surface.taffy.children(root_taffy_node).unwrap();
+        assert!(root_taffy_children.contains(child_taffy), "root node children do not contain: {child_taffy:?}");
+        assert_eq!(ui_surface.taffy.child_count(root_taffy_node).unwrap(), 1, "expected root node child count to be 1");
     }
 
     #[test]
