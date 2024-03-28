@@ -87,6 +87,7 @@ impl UiSurface {
         style: &Style,
         context: &LayoutContext,
     ) {
+        println!("upsert: {root_node_entity}, camera: {camera_entity}");
         let mut added = false;
         let ui_node_meta = self
             .ui_node_meta
@@ -183,6 +184,7 @@ impl UiSurface {
                     root_node_entities.remove(root_node_entity);
                 }
             }
+            // self.remove_children_recursive(removed.root_node_pair.user_root_node);
             self.cleanup_root_pair_in_taffy(removed.root_node_pair);
         }
     }
@@ -251,11 +253,28 @@ without UI components as a child of an entity with UI components, results may be
             .set_children(*taffy_node, &taffy_children)
             .unwrap();
     }
+    
+    fn remove_children_recursive(&mut self, node: taffy::node::Node) {
+        let Ok(children) = self.taffy.children(node) else {
+            return;
+        };
+        let mut children_to_remove = children;
+        while !children_to_remove.is_empty() {
+            let Some(child) = children_to_remove.pop() else {
+                continue;
+            };
+            if let Ok(mut children) = self.taffy.children(child) {
+                children_to_remove.append(&mut children);
+            }
+            println!("removing child: {child:?}");
+            self.taffy.remove(child).unwrap();
+        }
+    }
 
     /// Removes children from the entity's taffy node if it exists. Does nothing otherwise.
     pub fn try_remove_children(&mut self, entity: Entity) {
         if let Some(taffy_node) = self.get_root_node_taffy_node(&entity) {
-            self.taffy.set_children(*taffy_node, &[]).unwrap();
+            self.remove_children_recursive(*taffy_node);
         }
     }
 
@@ -349,8 +368,9 @@ without UI components as a child of an entity with UI components, results may be
                        children_set.remove(orphan);
                    }
                }
-               self.taffy.set_children(ui_meta.root_node_pair.implicit_viewport_node, &[]).unwrap();
-               println!("{:?}", ui_meta.root_node_pair.implicit_viewport_node);
+               println!("implicit_viewport_node: {:?} children: {:?}", ui_meta.root_node_pair.implicit_viewport_node, self.taffy.child_count(ui_meta.root_node_pair.implicit_viewport_node).unwrap());
+               println!("root_node_pair: {:?} children: {:?}", ui_meta.root_node_pair.user_root_node, self.taffy.child_count(ui_meta.root_node_pair.user_root_node).unwrap());
+               // self.taffy.set_children(ui_meta.root_node_pair.implicit_viewport_node, &[]).unwrap();
            }
        }
     }

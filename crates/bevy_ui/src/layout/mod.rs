@@ -62,6 +62,7 @@ pub struct UiLayoutSystemRemovedComponentParam<'w, 's> {
 /// Updates the UI's layout tree, computes the new layout geometry and then updates the sizes and transforms of all the UI nodes.
 #[allow(clippy::too_many_arguments)]
 pub fn ui_layout_system(
+    mut total_nodes: bevy_ecs::prelude::Local<usize>,
     primary_window: Query<(Entity, &Window), With<PrimaryWindow>>,
     cameras: Query<(Entity, &Camera)>,
     default_ui_camera: DefaultUiCamera,
@@ -261,6 +262,18 @@ pub fn ui_layout_system(
                     );
                 }
             }
+        }
+    }
+
+    if *total_nodes != ui_surface.taffy.total_node_count() {
+        *total_nodes = ui_surface.taffy.total_node_count();
+        println!("total_nodes: {:?}", *total_nodes);
+        for (entity, ui_meta) in ui_surface.ui_node_meta.iter() {
+            let camera_entity_string = ui_meta.camera_entity.map_or("None".to_string(), |v| v.to_string());
+            let user_root_node = ui_meta.root_node_pair.user_root_node;
+            let implicit_viewport_node = ui_meta.root_node_pair.implicit_viewport_node;
+            let children = ui_surface.taffy.child_count(user_root_node).unwrap();
+            println!("entity: {entity}, camera: {camera_entity_string}, root_node: {user_root_node:?}, viewport: {implicit_viewport_node:?}, children: {children}");
         }
     }
 }
