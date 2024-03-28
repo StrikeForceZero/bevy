@@ -21,6 +21,7 @@ use bevy_utils::tracing::warn;
 use bevy_utils::{HashMap, HashSet};
 use bevy_window::{PrimaryWindow, Window, WindowScaleFactorChanged};
 use thiserror::Error;
+use bevy_ecs::entity::EntityHashSet;
 
 #[derive(Debug)]
 pub struct LayoutContext {
@@ -322,11 +323,12 @@ fn round_layout_coords(value: Vec2) -> Vec2 {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Debug;
     use crate::layout::round_layout_coords;
     use crate::layout::ui_surface::UiSurface;
     use crate::prelude::*;
-    use crate::ui_layout_system;
-    use crate::update::update_target_camera_system;
+    use crate::{ui_layout_system, UiStack};
+    use crate::update::{update_clipping_system, update_target_camera_system};
     use crate::ContentSize;
     use bevy_asset::AssetEvent;
     use bevy_asset::Assets;
@@ -334,7 +336,7 @@ mod tests {
     use bevy_ecs::entity::Entity;
     use bevy_ecs::event::Events;
     use bevy_ecs::prelude::{Commands, Component, In, Query, With};
-    use bevy_ecs::query::Without;
+    use bevy_ecs::query::{QueryData, QueryEntityError, Without, WorldQuery};
     use bevy_ecs::schedule::apply_deferred;
     use bevy_ecs::schedule::IntoSystemConfigs;
     use bevy_ecs::schedule::Schedule;
@@ -342,7 +344,7 @@ mod tests {
     use bevy_ecs::world::World;
     use bevy_hierarchy::{despawn_with_children_recursive, BuildWorldChildren, Children, Parent};
     use bevy_math::{vec2, Rect, UVec2, Vec2};
-    use bevy_render::camera::ManualTextureViews;
+    use bevy_render::camera::{ManualTextureViews, Viewport};
     use bevy_render::camera::OrthographicProjection;
     use bevy_render::prelude::Camera;
     use bevy_render::texture::Image;
@@ -356,6 +358,8 @@ mod tests {
     use bevy_window::WindowResolution;
     use bevy_window::WindowScaleFactorChanged;
     use taffy::tree::LayoutTree;
+    use bevy_transform::systems::{propagate_transforms, sync_simple_transforms};
+    use crate::stack::ui_stack_system;
 
     #[test]
     fn round_layout_coords_must_round_ties_up() {
@@ -396,6 +400,8 @@ mod tests {
                 update_target_camera_system,
                 apply_deferred,
                 ui_layout_system,
+                sync_simple_transforms,
+                propagate_transforms,
             )
                 .chain(),
         );
@@ -723,15 +729,11 @@ mod tests {
         ui_schedule.run(&mut world);
 
         let overlap_check = world
-            .query_filtered::<(Entity, &Node, &mut GlobalTransform, &Transform), Without<Parent>>()
+            .query_filtered::<(Entity, &Node, &GlobalTransform), Without<Parent>>()
             .iter_mut(&mut world)
             .fold(
                 Option::<(Rect, bool)>::None,
-                |option_rect, (entity, node, mut global_transform, transform)| {
-                    // fix global transform - for some reason the global transform isn't populated yet.
-                    // might be related to how these specific tests are working directly with World instead of App
-                    *global_transform = GlobalTransform::from(transform.compute_affine());
-                    let global_transform = &*global_transform;
+                |option_rect, (entity, node, global_transform)| {
                     let current_rect = node.logical_rect(global_transform);
                     assert!(
                         current_rect.height().abs() + current_rect.width().abs() > 0.,
@@ -759,32 +761,32 @@ mod tests {
         assert!(is_overlapping, "root ui nodes are expected to behave like they have absolute position and be independent from each other");
     }
 
+    fn _update_camera_viewports(
+        primary_window_query: Query<&Window, With<PrimaryWindow>>,
+        mut cameras: Query<&mut Camera>,
+    ) {
+        let primary_window = primary_window_query
+            .get_single()
+            .expect("missing primary window");
+        let camera_count = cameras.iter().len();
+        for (camera_index, mut camera) in cameras.iter_mut().enumerate() {
+            let viewport_width =
+                primary_window.resolution.physical_width() / camera_count as u32;
+            let viewport_height = primary_window.resolution.physical_height();
+            let physical_position = UVec2::new(viewport_width * camera_index as u32, 0);
+            let physical_size = UVec2::new(viewport_width, viewport_height);
+            camera.viewport = Some(bevy_render::camera::Viewport {
+                physical_position,
+                physical_size,
+                ..default()
+            });
+        }
+    }
+
     #[test]
     fn ui_node_should_properly_update_when_changing_target_camera() {
         #[derive(Component)]
         struct MovingUiNode;
-
-        fn update_camera_viewports(
-            primary_window_query: Query<&Window, With<PrimaryWindow>>,
-            mut cameras: Query<&mut Camera>,
-        ) {
-            let primary_window = primary_window_query
-                .get_single()
-                .expect("missing primary window");
-            let camera_count = cameras.iter().len();
-            for (camera_index, mut camera) in cameras.iter_mut().enumerate() {
-                let viewport_width =
-                    primary_window.resolution.physical_width() / camera_count as u32;
-                let viewport_height = primary_window.resolution.physical_height();
-                let physical_position = UVec2::new(viewport_width * camera_index as u32, 0);
-                let physical_size = UVec2::new(viewport_width, viewport_height);
-                camera.viewport = Some(bevy_render::camera::Viewport {
-                    physical_position,
-                    physical_size,
-                    ..default()
-                });
-            }
-        }
 
         fn move_ui_node(
             In(pos): In<Vec2>,
@@ -873,7 +875,7 @@ mod tests {
         // add total cameras - 1 (the assumed default) to get an idea for how many nodes we should expect
         let expected_max_taffy_node_count = get_taffy_node_count(&world) + total_cameras - 1;
 
-        world.run_system_once(update_camera_viewports);
+        world.run_system_once(_update_camera_viewports);
 
         ui_schedule.run(&mut world);
 
@@ -1027,6 +1029,547 @@ mod tests {
                 assert!((width_sum - 320.).abs() <= 1.);
                 s += r;
             }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct LeftRightCameraEntity {
+        left: Entity,
+        right: Entity,
+    }
+    fn _multi_camera_setup(world: &mut World) -> LeftRightCameraEntity {
+        let left_camera_entity = world.query_filtered::<Entity, With<Camera>>().get_single(&world).expect("missing camera");
+        let right_camera_entity = world.spawn(Camera2dBundle {
+            camera: Camera {
+                order: 1,
+                ..default()
+            },
+            ..default()
+        }).id();
+        LeftRightCameraEntity { left: left_camera_entity, right: right_camera_entity }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct PartialLeftRightCameraEntity {
+        left: Option<Entity>,
+        right: Option<Entity>,
+    }
+
+    impl From<LeftRightCameraEntity> for PartialLeftRightCameraEntity {
+        fn from(value: LeftRightCameraEntity) -> Self {
+            Self {
+                left: Some(value.left),
+                right: Some(value.right),
+            }
+        }
+    }
+
+    trait IsLargerThan<T> {
+        fn is_larger_than(&self, other: T) -> bool;
+    }
+
+    impl IsLargerThan<Rect> for Rect {
+        fn is_larger_than(&self, other: Rect) -> bool {
+            self.height() > other.height() && self.width() > other.width()
+        }
+    }
+
+    trait IsSameSizeAs<T> {
+        fn is_same_size_as(&self, other: T) -> bool;
+    }
+
+    impl IsSameSizeAs<Rect> for Rect {
+        fn is_same_size_as(&self, other: Rect) -> bool {
+            self.height() == other.height() && self.width() == other.width()
+        }
+    }
+
+    trait HasPositiveArea<T> {
+        fn has_positive_area(&self) -> bool;
+    }
+
+    impl HasPositiveArea<Rect> for Rect {
+        fn has_positive_area(&self) -> bool {
+            self.height() > 0. && self.width() > 0.
+        }
+    }
+
+    trait ShiftBy<T, V> {
+        fn shift_by(&self, amount: V) -> T;
+    }
+
+    impl ShiftBy<Rect, Rect> for Rect {
+        fn shift_by(&self, amount: Rect) -> Rect {
+            Rect::from_corners(self.min + amount.min, self.max + amount.min)
+        }
+    }
+
+    trait SplitAt<T, V> {
+        fn split_at(&self, split: V) -> (T, T);
+    }
+    trait SplitHalf<T, V> {
+        fn split_half(&self, split: V) -> (T, T);
+    }
+
+    enum SplitHalfAxis {
+        X,
+        Y,
+    }
+    impl SplitHalf<Rect, SplitHalfAxis> for Rect {
+        fn split_half(&self, split: SplitHalfAxis) -> (Rect, Rect) {
+            match split {
+                SplitHalfAxis::X => {
+                    let mid_x = self.center().x;
+                    (
+                        Rect::from_corners(self.min, Vec2::new(mid_x, self.max.y)),
+                        Rect::from_corners(Vec2::new(mid_x, self.min.y), self.max)
+                    )
+                },
+                SplitHalfAxis::Y => {
+                    let mid_y = self.center().y;
+                    (
+                        Rect::from_corners(self.min, Vec2::new(self.max.x, mid_y)),
+                        Rect::from_corners(Vec2::new(self.min.x, mid_y), self.max)
+                    )
+                },
+            }
+        }
+    }
+
+    enum SplitAtAxis {
+        X(f32),
+        Y(f32),
+    }
+    impl SplitAt<Rect, SplitAtAxis> for Rect {
+        fn split_at(&self, split: SplitAtAxis) -> (Rect, Rect) {
+            match split {
+                SplitAtAxis::X(x) => { (Rect::from_corners(self.min, Vec2::new(self.min.x + x, self.max.y)), Rect::from_corners(self.min + Vec2::new(x, 0.), self.max)) }
+                SplitAtAxis::Y(y) => { (Rect::from_corners(self.min, Vec2::new(self.max.x, self.min.y + y)), Rect::from_corners(self.min + Vec2::new(0., y), self.max)) }
+            }
+        }
+    }
+
+    #[test]
+    fn test_rect_split_in_half() {
+        let rect = Rect::from_corners(Vec2::ZERO, Vec2::ONE);
+        assert_eq!(
+            rect.split_at(SplitAtAxis::Y(0.0)),
+            (
+                Rect::from_corners(Vec2::ZERO, Vec2::new(1., 0.)),
+                Rect::from_corners(Vec2::ZERO, Vec2::ONE),
+            )
+        );
+        assert_eq!(
+            rect.split_at(SplitAtAxis::Y(0.5)),
+            (
+                Rect::from_corners(Vec2::ZERO, Vec2::new(1.0, 0.5)),
+                Rect::from_corners(Vec2::new(0.0, 0.5), Vec2::ONE),
+            )
+        );
+        assert_eq!(
+            rect.split_at(SplitAtAxis::Y(1.0)),
+            (
+                Rect::from_corners(Vec2::ZERO, Vec2::ONE),
+                Rect::from_corners(Vec2::new(0.0, 1.0), Vec2::ONE),
+            )
+        );
+
+        assert_eq!(
+            rect.split_at(SplitAtAxis::X(0.0)),
+            (
+                Rect::from_corners(Vec2::ZERO, Vec2::new(0.0, 1.0)),
+                Rect::from_corners(Vec2::ZERO, Vec2::ONE),
+            )
+        );
+        assert_eq!(
+            rect.split_at(SplitAtAxis::X(0.5)),
+            (
+                Rect::from_corners(Vec2::ZERO, Vec2::new(0.5, 1.0)),
+                Rect::from_corners(Vec2::new(0.5, 0.0), Vec2::ONE),
+            )
+        );
+        assert_eq!(
+            rect.split_at(SplitAtAxis::X(1.0)),
+            (
+                Rect::from_corners(Vec2::ZERO, Vec2::ONE),
+                Rect::from_corners(Vec2::new(1.0, 0.0), Vec2::ONE),
+            )
+        );
+    }
+
+    trait PhysicalRect {
+        fn get_rect(&self) -> Rect;
+    }
+
+    trait PhysicalRectOption {
+        fn get_rect(&self) -> Option<Rect>;
+    }
+
+    impl PhysicalRect for Window {
+        fn get_rect(&self) -> Rect {
+            Rect::from_corners(Vec2::ZERO, self.resolution.physical_size().as_vec2())
+        }
+    }
+
+    impl PhysicalRect for Viewport {
+        fn get_rect(&self) -> Rect {
+            let p_pos = self.physical_position;
+            let p_size = self.physical_size;
+            Rect::from_corners(p_pos.as_vec2(), (p_pos + p_size).as_vec2())
+        }
+    }
+
+    #[derive(Debug, Component)]
+    struct CustomIdMarker(&'static str);
+
+    #[derive(Debug)]
+    struct BaseExoticMultiCameraSetupRef<C: Debug, E: Debug> {
+        cameras: C,
+
+        ui_left_1: E,
+        ui_left_1a: E,
+
+        ui_right_1: E,
+        ui_right_1a: E,
+        ui_right_1b: E,
+
+        ui_right_2: E,
+        ui_right_2a: E,
+        ui_right_2b: E,
+    }
+
+    #[derive(Debug)]
+    struct ExoticMultiCameraSetupRef<'a> {
+        world: &'a mut World,
+        initial: BaseExoticMultiCameraSetupRef<LeftRightCameraEntity, Entity>,
+        state: BaseExoticMultiCameraSetupRef<PartialLeftRightCameraEntity, Option<Entity>>,
+    }
+
+    macro_rules! validate_single_params {
+        ($self:expr, $field1:ident, $field2:ident) => {
+            (
+                concat!(stringify!($field1), ".", stringify!($field2)),
+                $self.initial.$field1.$field2.clone(),
+                $self.state.$field1.$field2.clone(),
+            )
+        };
+        ($self:expr, $field1:ident) => {
+            (
+                stringify!($field1),
+                $self.initial.$field1.clone(),
+                $self.state.$field1.clone(),
+            )
+        };
+    }
+
+    impl<'a> ExoticMultiCameraSetupRef<'a> {
+        fn from_populated_base(world: &'a mut World, base: BaseExoticMultiCameraSetupRef::<PartialLeftRightCameraEntity, Option<Entity>>) -> Self {
+            assert!(base.ui_left_1.is_some(), "missing ui_left_1");
+            assert!(base.ui_left_1a.is_some(), "missing ui_left_1a");
+            assert!(base.ui_right_1.is_some(), "missing ui_right_1");
+            assert!(base.ui_right_1a.is_some(), "missing ui_right_1a");
+            assert!(base.ui_right_1b.is_some(), "missing ui_right_1b");
+            assert!(base.ui_right_2.is_some(), "missing ui_right_2");
+            assert!(base.ui_right_2a.is_some(), "missing ui_right_2a");
+            assert!(base.ui_right_2b.is_some(), "missing ui_right_2b");
+            Self {
+                world,
+                initial: BaseExoticMultiCameraSetupRef::<LeftRightCameraEntity, Entity> {
+                    cameras: LeftRightCameraEntity { left: base.cameras.left.unwrap(), right: base.cameras.right.unwrap() },
+                    ui_left_1: base.ui_left_1.unwrap(),
+                    ui_left_1a: base.ui_left_1a.unwrap(),
+                    ui_right_1: base.ui_right_1.unwrap(),
+                    ui_right_1a: base.ui_right_1a.unwrap(),
+                    ui_right_1b: base.ui_right_1b.unwrap(),
+                    ui_right_2: base.ui_right_2.unwrap(),
+                    ui_right_2a: base.ui_right_2a.unwrap(),
+                    ui_right_2b: base.ui_right_2b.unwrap(),
+                },
+                state: base,
+            }
+        }
+
+        fn single_validate<'b, Q, F>(&'b mut self, params: (&'static str, Entity, Option<Entity>), custom_validate: F) where
+            Q: QueryData<ReadOnly = Q> + 'b,
+            F: FnOnce(&str, <Q as WorldQuery>::Item<'b>)
+        {
+            let (label, initial, state) = params;
+            let expects_to_exist = state.is_some();
+
+            match self.world.query::<Q>().get(self.world, initial) {
+                Ok(component) => {
+                    assert!(expects_to_exist, "{label}: Entity {initial} was not expected to exist anymore!");
+                    custom_validate(label, component);
+                },
+                Err(err) => {
+                    match err {
+                        QueryEntityError::QueryDoesNotMatch(_) | QueryEntityError::AliasedMutability(_) => { panic!("{label}: query failed, bad test setup - {err:?}") }
+                        QueryEntityError::NoSuchEntity(_) => {}
+                    }
+                    assert!(!expects_to_exist, "{label}: Entity {initial} was expected to still exist!");
+                }
+            }
+        }
+
+        fn validate(&mut self) {
+            let primary_window = self.world.query_filtered::<&Window, With<PrimaryWindow>>().get_single(self.world).expect("missing primary window");
+            let window_rect = primary_window.get_rect();
+            assert!(window_rect.has_positive_area());
+            let window_center = window_rect.center();
+
+            let mut left_rect = Rect::default();
+            let mut right_rect = Rect::default();
+
+            self.single_validate::<(&Camera), _>(validate_single_params!(self, cameras, left), |label, (c)| {
+                left_rect = c.logical_viewport_rect().unwrap();
+                assert_eq!(left_rect, window_rect.split_at(SplitAtAxis::X(window_center.x)).0, "{label} not in expected bounds");
+            });
+            if self.state.cameras.left.is_some() {
+                assert!(left_rect.has_positive_area());
+            }
+            self.single_validate::<(&Camera), _>(validate_single_params!(self, cameras, right), |label, (c)| {
+                right_rect = c.logical_viewport_rect().unwrap();
+                assert_eq!(right_rect, window_rect.split_at(SplitAtAxis::X(window_center.x)).1, "{label} not in expected bounds");
+            });
+            if self.state.cameras.right.is_some() {
+                assert!(right_rect.has_positive_area());
+            }
+
+            // these assume nothing has been removed
+            self.single_validate::<(&Node, &GlobalTransform), _>(validate_single_params!(self, ui_left_1), |label, (n, g)| {
+                assert_eq!(n.logical_rect(g).shift_by(left_rect), left_rect, "{label} not in expected bounds");
+            });
+            self.single_validate::<(&Node, &GlobalTransform, &Transform), _>(validate_single_params!(self, ui_left_1a), |label, (n, g, t)| {
+                assert_eq!(n.logical_rect(g).shift_by(left_rect), left_rect, "{label} not in expected bounds");
+            });
+            self.single_validate::<(&Node, &GlobalTransform), _>(validate_single_params!(self, ui_right_1), |label, (n, g)| {
+                assert_eq!(n.logical_rect(g).shift_by(right_rect), right_rect.split_half(SplitHalfAxis::Y).0, "{label} not in expected bounds");
+            });
+            self.single_validate::<(&Node, &GlobalTransform, &Transform), _>(validate_single_params!(self, ui_right_1a), |label, (n, g, t)| {
+                assert_eq!(n.logical_rect(g).shift_by(right_rect), right_rect.split_half(SplitHalfAxis::Y).0.split_half(SplitHalfAxis::Y).0, "{label} not in expected bounds");
+            });
+            self.single_validate::<(&Node, &GlobalTransform, &Transform), _>(validate_single_params!(self, ui_right_1b), |label, (n, g, t)| {
+                assert_eq!(n.logical_rect(g).shift_by(right_rect), right_rect.split_half(SplitHalfAxis::Y).0.split_half(SplitHalfAxis::Y).1, "{label} not in expected bounds");
+            });
+            self.single_validate::<(&Node, &GlobalTransform), _>(validate_single_params!(self, ui_right_2), |label, (n, g)| {
+                assert_eq!(n.logical_rect(g).shift_by(right_rect), right_rect.split_half(SplitHalfAxis::Y).1, "{label} not in expected bounds");
+            });
+            self.single_validate::<(&Node, &GlobalTransform), _>(validate_single_params!(self, ui_right_2a), |label, (n, g)| {
+                assert_eq!(n.logical_rect(g).shift_by(right_rect), right_rect.split_half(SplitHalfAxis::Y).1.split_half(SplitHalfAxis::Y).0, "{label} not in expected bounds");
+            });
+            self.single_validate::<(&Node, &GlobalTransform), _>(validate_single_params!(self, ui_right_2b), |label, (n, g)| {
+                assert_eq!(n.logical_rect(g).shift_by(right_rect), right_rect.split_half(SplitHalfAxis::Y).1.split_half(SplitHalfAxis::Y).1, "{label} not in expected bounds");
+            });
+
+
+
+            // loosely validate taffy state (node count)
+            let left = vec![
+                self.state.ui_left_1,
+                self.state.ui_left_1a,
+            ];
+            let right = vec![
+                self.state.ui_right_1,
+                self.state.ui_right_1a,
+                self.state.ui_right_1b,
+                self.state.ui_right_2,
+                self.state.ui_right_2a,
+                self.state.ui_right_2b,
+            ];
+            let mut all_items = left.clone();
+            all_items.append(&mut right.clone());
+
+            const NODES_PER_ITEM: usize = 2;
+
+            let total_node_count = all_items.len() * NODES_PER_ITEM;
+            let nodes_alive_count = all_items.iter().fold(0, |sum, item| sum + item.is_some() as usize) * NODES_PER_ITEM;
+            let mut expected_node_count_negative_offset = 0;
+            if self.state.cameras.left.is_none() {
+                expected_node_count_negative_offset += left.len() * NODES_PER_ITEM;
+            }
+            if self.state.cameras.right.is_none() {
+                expected_node_count_negative_offset += right.len() * NODES_PER_ITEM;
+            }
+
+            let expected_node_count = (total_node_count - expected_node_count_negative_offset).min(nodes_alive_count);
+
+            assert_eq!(self.world.resource::<UiSurface>().taffy.total_node_count(), expected_node_count);
+        }
+    }
+
+    fn _exotic_multi_camera_ui_setup(world: &mut World, cameras: LeftRightCameraEntity) -> ExoticMultiCameraSetupRef {
+        let mut res = BaseExoticMultiCameraSetupRef::<PartialLeftRightCameraEntity, Option<Entity>> {
+            cameras: cameras.clone().into(),
+            ui_left_1: None,
+            ui_left_1a: None,
+            ui_right_1: None,
+            ui_right_1a: None,
+            ui_right_1b: None,
+            ui_right_2: None,
+            ui_right_2a: None,
+            ui_right_2b: None,
+        };
+
+        res.ui_left_1 = Some(world.spawn((
+            CustomIdMarker("L:1"),
+            NodeBundle {
+                style: Style {
+                    flex_direction: FlexDirection::Column,
+                    width: Val::Percent(100.),
+                    height: Val::Percent(100.),
+                    ..default()
+                },
+                ..default()
+            },
+            TargetCamera(cameras.left),
+        )).with_children(|children| {
+            res.ui_left_1a = Some(children.spawn((
+                CustomIdMarker("L:1A"),
+                NodeBundle {
+                    style: Style {
+                        width: Val::Percent(100.),
+                        height: Val::Percent(100.),
+                        ..default()
+                    },
+                    ..default()
+                },
+            )).id());
+        }).id());
+
+        res.ui_right_1 = Some(world.spawn((
+            CustomIdMarker("R:1"),
+            NodeBundle {
+                style: Style {
+                    flex_direction: FlexDirection::Column,
+                    width: Val::Percent(100.),
+                    height: Val::Percent(50.),
+                    ..default()
+                },
+                ..default()
+            },
+            TargetCamera(cameras.right),
+        )).with_children(|children| {
+            res.ui_right_1a = Some(children.spawn((
+                CustomIdMarker("R:1A"),
+                NodeBundle {
+                    style: Style {
+                        width: Val::Percent(100.),
+                        height: Val::Percent(50.),
+                        ..default()
+                    },
+                    ..default()
+                },
+            )).id());
+            res.ui_right_1b = Some(children.spawn((
+                CustomIdMarker("R:1B"),
+                NodeBundle {
+                    style: Style {
+                        width: Val::Percent(100.),
+                        height: Val::Percent(50.),
+                        ..default()
+                    },
+                    ..default()
+                },
+            )).id());
+        }).id());
+
+        res.ui_right_2 = Some(world.spawn((
+            CustomIdMarker("R:2"),
+            NodeBundle {
+                style: Style {
+                    flex_direction: FlexDirection::Column,
+                    width: Val::Percent(100.),
+                    height: Val::Percent(50.),
+                    top: Val::Percent(50.),
+                    ..default()
+                },
+                ..default()
+            },
+            TargetCamera(cameras.right),
+        )).with_children(|children| {
+            res.ui_right_2a = Some(children.spawn((
+                NodeBundle {
+                    style: Style {
+                        width: Val::Percent(100.),
+                        height: Val::Percent(50.),
+                        ..default()
+                    },
+                    ..default()
+                },
+                CustomIdMarker("R:2A"),
+            )).id());
+            res.ui_right_2b = Some(children.spawn((
+                CustomIdMarker("R:2B"),
+                NodeBundle {
+                    style: Style {
+                        width: Val::Percent(100.),
+                        height: Val::Percent(50.),
+                        ..default()
+                    },
+                    ..default()
+                },
+            )).id());
+        }).id());
+
+        ExoticMultiCameraSetupRef::from_populated_base(world, res)
+    }
+
+    #[test]
+    fn test_layouts_for_correctness() {
+        let (mut world, mut ui_schedule) = setup_ui_test_world();
+        let left_right_camera_entity = _multi_camera_setup(&mut world);
+
+        world.run_system_once(_update_camera_viewports);
+
+        let mut instance = _exotic_multi_camera_ui_setup(&mut world, left_right_camera_entity);
+        ui_schedule.run(instance.world);
+        instance.validate();
+
+        instance.world.commands().entity(instance.initial.ui_right_1).insert(TargetCamera(instance.initial.cameras.left));
+
+        ui_schedule.run(instance.world);
+        // TODO: make validate able to check when right points to left camera
+        // instance.validate();
+    }
+
+    #[test]
+    fn test_extraneous_taffy_node_creation() {
+        let (mut world, mut ui_schedule) = setup_ui_test_world();
+        let left_right_camera_entity = _multi_camera_setup(&mut world);
+
+        world.run_system_once(_update_camera_viewports);
+
+        let mut instance = _exotic_multi_camera_ui_setup(&mut world, left_right_camera_entity);
+
+        ui_schedule.run(instance.world);
+        instance.validate();
+
+        let ui_surface = instance.world.get_resource::<UiSurface>().unwrap();
+
+        let highest_node = ui_surface.ui_node_meta.iter().fold(Option::<taffy::node::Node>::None, |option_highest, (_, next_meta)| {
+            let mut cur_highest = option_highest.unwrap_or(next_meta.root_node_pair.implicit_viewport_node);
+            if cur_highest < next_meta.root_node_pair.implicit_viewport_node {
+                cur_highest = next_meta.root_node_pair.implicit_viewport_node;
+            }
+            if cur_highest < next_meta.root_node_pair.user_root_node {
+                cur_highest = next_meta.root_node_pair.user_root_node;
+            }
+            Some(cur_highest)
+        }).expect("nothing in scene");
+
+        ui_schedule.run(instance.world);
+        let ui_surface = instance.world.get_resource::<UiSurface>().unwrap();
+        for (_entity, ui_meta) in ui_surface.ui_node_meta.iter() {
+            assert!(ui_meta.root_node_pair.implicit_viewport_node <= highest_node, "extraneous taffy nodes are being created last known highest: {highest_node:?}, encountered (implicit_viewport_node): {:?}", ui_meta.root_node_pair.implicit_viewport_node);
+            assert!(ui_meta.root_node_pair.user_root_node <= highest_node, "extraneous taffy nodes are being created last known highest: {highest_node:?}, encountered (user_root_node): {:?}", ui_meta.root_node_pair.user_root_node);
+        }
+        instance.world.commands().entity(instance.initial.ui_right_1).insert(TargetCamera(instance.initial.cameras.left));
+
+        ui_schedule.run(instance.world);
+        let ui_surface = instance.world.get_resource::<UiSurface>().unwrap();
+        for (_entity, ui_meta) in ui_surface.ui_node_meta.iter() {
+            assert!(ui_meta.root_node_pair.implicit_viewport_node <= highest_node, "extraneous taffy nodes are being created last known highest: {highest_node:?}, encountered (implicit_viewport_node): {:?}", ui_meta.root_node_pair.implicit_viewport_node);
+            assert!(ui_meta.root_node_pair.user_root_node <= highest_node, "extraneous taffy nodes are being created last known highest: {highest_node:?}, encountered (user_root_node): {:?}", ui_meta.root_node_pair.user_root_node);
         }
     }
 }

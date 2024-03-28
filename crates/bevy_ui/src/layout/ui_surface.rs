@@ -349,10 +349,19 @@ without UI components as a child of an entity with UI components, results may be
             removed_children.remove(&ui_entity);
         }
 
-       for orphan in removed_children {
-           if let Some(ui_meta) = self.ui_node_meta.get_mut(&orphan) {
+       for orphan in removed_children.iter() {
+           if let Some(ui_meta) = self.ui_node_meta.get_mut(orphan) {
+               // TODO: while this works its spamming taffy nodes
                self.taffy.remove(ui_meta.root_node_pair.implicit_viewport_node).unwrap();
                ui_meta.root_node_pair.implicit_viewport_node = self.taffy.new_leaf(default_viewport_style()).unwrap();
+               // TODO: write potential missing regression test for if this was missing
+               // mark as orphan
+               // if let Some(camera_entity) = ui_meta.camera_entity.take() {
+               //     if let Some(children_set) = self.camera_to_ui_set.get_mut(&camera_entity) {
+               //         children_set.remove(orphan);
+               //     }
+               //     // self.taffy.set_children(ui_meta.root_node_pair.implicit_viewport_node, &[]).unwrap();
+               // }
            }
        }
     }
@@ -375,6 +384,9 @@ without UI components as a child of an entity with UI components, results may be
             let Some(ui_meta) = self.ui_node_meta.get(&root_node_entity) else {
                 continue;
             };
+            if ui_meta.camera_entity.is_none() {
+                panic!("internal map out of sync");
+            }
 
             self.taffy
                 .compute_layout(
