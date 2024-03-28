@@ -522,10 +522,10 @@ mod tests {
         let (mut world, mut ui_schedule) = setup_ui_test_world();
         let (ui_entity, child_entity) = _track_ui_entity_setup(&mut world, &mut ui_schedule);
 
-        world.despawn(ui_entity);
+        despawn_with_children_recursive(&mut world, ui_entity);
 
-        // `ui_layout_system` should remove `ui_entity` from `UiSurface::entity_to_taffy`
-        world.commands().entity(ui_entity).despawn_recursive();
+        // `ui_layout_system` should remove `ui_entity` and `child_entity` from `UiSurface::entity_to_taffy`
+        ui_schedule.run(&mut world);
 
         let ui_surface = world.resource::<UiSurface>();
         assert!(!ui_surface.entity_to_taffy.contains_key(&ui_entity));
@@ -535,19 +535,19 @@ mod tests {
     }
 
     #[test]
-    fn ui_surface_tracks_ui_entities_deaspwn_decendents() {
+    fn ui_surface_tracks_ui_entities_despawn_descendants() {
         let (mut world, mut ui_schedule) = setup_ui_test_world();
         let (ui_entity, child_entity) = _track_ui_entity_setup(&mut world, &mut ui_schedule);
-
+        
         world.commands().entity(ui_entity).despawn_descendants();
 
-        // `ui_layout_system` should remove `ui_entity` from `UiSurface::entity_to_taffy`
+        // `ui_layout_system` should remove `child_entity` from `UiSurface::entity_to_taffy`
         ui_schedule.run(&mut world);
 
         let ui_surface = world.resource::<UiSurface>();
-        assert!(!ui_surface.entity_to_taffy.contains_key(&ui_entity));
+        assert!(ui_surface.entity_to_taffy.contains_key(&ui_entity));
         assert_eq!(ui_surface.entity_to_taffy.len(), 1);
-        assert!(!ui_surface.ui_root_node_meta.contains_key(&ui_entity));
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity));
         assert_eq!(ui_surface.ui_root_node_meta.len(), 1);
     }
 
