@@ -131,28 +131,10 @@ impl UiSurface {
                     }
                 }
 
-                if false {
-                    self.camera_to_ui_set
-                        .entry(camera_entity)
-                        .or_default()
-                        .insert(root_node_entity);
-
-                    if let Some(parent) = self
-                        .taffy
-                        .parent(ui_node_meta.root_node_pair.user_root_node)
-                    {
-                        self.taffy
-                            .remove_child(parent, ui_node_meta.root_node_pair.user_root_node)
-                            .unwrap();
-                    }
-
-                    self.taffy
-                        .add_child(
-                            ui_node_meta.root_node_pair.implicit_viewport_node,
-                            ui_node_meta.root_node_pair.user_root_node,
-                        )
-                        .unwrap();
-                }
+                self.camera_to_ui_set
+                    .entry(camera_entity)
+                    .or_default()
+                    .insert(root_node_entity);
             }
 
             self.taffy
@@ -324,7 +306,17 @@ without UI components as a child of an entity with UI components, results may be
             let Some(ui_meta) = self.ui_node_meta.get_mut(&ui_entity) else {
                 panic!("ui node not found in internal map or removed early")
             };
-            ui_meta.camera_entity = Some(camera_entity);
+            if let Some(old_camera) = ui_meta.camera_entity.replace(camera_entity) {
+                if old_camera != camera_entity {
+                    if let Some(old_siblings_set) = self.camera_to_ui_set.get_mut(&old_camera) {
+                        old_siblings_set.remove(&ui_entity);
+                    }
+                    // self.taffy.set_style(ui_meta.root_node_pair.implicit_viewport_node, default_viewport_style()).unwrap();
+                }
+            }
+            let Some(ui_meta) = self.ui_node_meta.get_mut(&ui_entity) else {
+                panic!("ui node not found in internal map or removed early")
+            };
 
             // fix taffy relationships
             {
@@ -351,17 +343,14 @@ without UI components as a child of an entity with UI components, results may be
 
        for orphan in removed_children.iter() {
            if let Some(ui_meta) = self.ui_node_meta.get_mut(orphan) {
-               // TODO: while this works its spamming taffy nodes
-               self.taffy.remove(ui_meta.root_node_pair.implicit_viewport_node).unwrap();
-               ui_meta.root_node_pair.implicit_viewport_node = self.taffy.new_leaf(default_viewport_style()).unwrap();
-               // TODO: write potential missing regression test for if this was missing
                // mark as orphan
-               // if let Some(camera_entity) = ui_meta.camera_entity.take() {
-               //     if let Some(children_set) = self.camera_to_ui_set.get_mut(&camera_entity) {
-               //         children_set.remove(orphan);
-               //     }
-               //     // self.taffy.set_children(ui_meta.root_node_pair.implicit_viewport_node, &[]).unwrap();
-               // }
+               if let Some(camera_entity) = ui_meta.camera_entity.take() {
+                   if let Some(children_set) = self.camera_to_ui_set.get_mut(&camera_entity) {
+                       children_set.remove(orphan);
+                   }
+               }
+               self.taffy.set_children(ui_meta.root_node_pair.implicit_viewport_node, &[]).unwrap();
+               println!("{:?}", ui_meta.root_node_pair.implicit_viewport_node);
            }
        }
     }
