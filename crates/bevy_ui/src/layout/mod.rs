@@ -358,7 +358,7 @@ mod tests {
     use bevy_ecs::schedule::Schedule;
     use bevy_ecs::system::RunSystemOnce;
     use bevy_ecs::world::World;
-    use bevy_hierarchy::{despawn_with_children_recursive, BuildWorldChildren, Children, Parent};
+    use bevy_hierarchy::{despawn_with_children_recursive, BuildWorldChildren, Children, Parent, BuildChildren, DespawnRecursiveExt};
     use bevy_math::{vec2, Rect, UVec2, Vec2};
     use bevy_render::camera::{ManualTextureViews, Viewport};
     use bevy_render::camera::OrthographicProjection;
@@ -463,12 +463,9 @@ mod tests {
             assert_eq!(layout.size.height, WINDOW_HEIGHT);
         }
     }
-
-    #[test]
-    fn ui_surface_tracks_ui_entities() {
-        let (mut world, mut ui_schedule) = setup_ui_test_world();
-
-        ui_schedule.run(&mut world);
+    
+    fn _track_ui_entity_setup(world: &mut World, ui_schedule: &mut Schedule) -> (Entity, Entity) {
+        ui_schedule.run(world);
 
         // no UI entities in world, none in UiSurface
         let ui_surface = world.resource::<UiSurface>();
@@ -477,20 +474,81 @@ mod tests {
         let ui_entity = world.spawn(NodeBundle::default()).id();
 
         // `ui_layout_system` should map `ui_entity` to a ui node in `UiSurface::entity_to_taffy`
-        ui_schedule.run(&mut world);
+        ui_schedule.run(world);
 
         let ui_surface = world.resource::<UiSurface>();
+        assert!(ui_surface.entity_to_taffy.contains_key(&ui_entity));
+        assert_eq!(ui_surface.entity_to_taffy.len(), 1);
         assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity));
         assert_eq!(ui_surface.ui_root_node_meta.len(), 1);
 
+        let child_entity =  world.spawn(NodeBundle::default()).id();
+        world.commands().entity(ui_entity).add_child(child_entity);
+
+        // `ui_layout_system` should add `child_entity` as a child of `ui_entity`
+        ui_schedule.run(world);
+
+        let ui_surface = world.resource::<UiSurface>();
+        assert!(ui_surface.entity_to_taffy.contains_key(&child_entity));
+        assert_eq!(ui_surface.entity_to_taffy.len(), 2);
+        assert!(!ui_surface.ui_root_node_meta.contains_key(&child_entity), "child should not have been added as a root node");
+        assert_eq!(ui_surface.ui_root_node_meta.len(), 1);
+        let ui_taffy = ui_surface.entity_to_taffy.get(&ui_entity).unwrap();
+        let child_taffy = ui_surface.entity_to_taffy.get(&child_entity).unwrap();
+        assert_eq!(ui_surface.taffy.parent(*child_taffy), Some(*ui_taffy), "expected to be child of root node");
+
+        (ui_entity, child_entity)
+    }
+   
+    #[test]
+    fn ui_surface_tracks_ui_entities_despawn() {
+        let (mut world, mut ui_schedule) = setup_ui_test_world();
+        let (ui_entity, child_entity) = _track_ui_entity_setup(&mut world, &mut ui_schedule);
+        
         world.despawn(ui_entity);
 
         // `ui_layout_system` should remove `ui_entity` from `UiSurface::entity_to_taffy`
         ui_schedule.run(&mut world);
 
         let ui_surface = world.resource::<UiSurface>();
+        assert!(!ui_surface.entity_to_taffy.contains_key(&ui_entity));
+        assert_eq!(ui_surface.entity_to_taffy.len(), 1);
         assert!(!ui_surface.ui_root_node_meta.contains_key(&ui_entity));
         assert!(ui_surface.ui_root_node_meta.is_empty());
+    }
+
+    #[test]
+    fn ui_surface_tracks_ui_entities_despawn_recursive() {
+        let (mut world, mut ui_schedule) = setup_ui_test_world();
+        let (ui_entity, child_entity) = _track_ui_entity_setup(&mut world, &mut ui_schedule);
+
+        world.despawn(ui_entity);
+
+        // `ui_layout_system` should remove `ui_entity` from `UiSurface::entity_to_taffy`
+        world.commands().entity(ui_entity).despawn_recursive();
+
+        let ui_surface = world.resource::<UiSurface>();
+        assert!(!ui_surface.entity_to_taffy.contains_key(&ui_entity));
+        assert!(ui_surface.entity_to_taffy.is_empty());
+        assert!(!ui_surface.ui_root_node_meta.contains_key(&ui_entity));
+        assert!(ui_surface.ui_root_node_meta.is_empty());
+    }
+
+    #[test]
+    fn ui_surface_tracks_ui_entities_deaspwn_decendents() {
+        let (mut world, mut ui_schedule) = setup_ui_test_world();
+        let (ui_entity, child_entity) = _track_ui_entity_setup(&mut world, &mut ui_schedule);
+
+        world.commands().entity(ui_entity).despawn_descendants();
+
+        // `ui_layout_system` should remove `ui_entity` from `UiSurface::entity_to_taffy`
+        ui_schedule.run(&mut world);
+
+        let ui_surface = world.resource::<UiSurface>();
+        assert!(!ui_surface.entity_to_taffy.contains_key(&ui_entity));
+        assert_eq!(ui_surface.entity_to_taffy.len(), 1);
+        assert!(!ui_surface.ui_root_node_meta.contains_key(&ui_entity));
+        assert_eq!(ui_surface.ui_root_node_meta.len(), 1);
     }
 
     #[test]
