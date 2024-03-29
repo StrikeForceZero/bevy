@@ -1,31 +1,40 @@
-use crate::UiSurface;
+use crate::ui_surface::UiSurface;
 use bevy_ecs::prelude::Entity;
 use bevy_utils::HashMap;
 use std::fmt::Write;
+use taffy::prelude::LayoutTree;
 use taffy::prelude::Node;
-use taffy::tree::LayoutTree;
 
 /// Prints a debug representation of the computed layout of the UI layout tree for each window.
-pub fn print_ui_layout_tree(ui_surface: &UiSurface) {
+pub fn print_ui_layout_tree<F: Fn(String)>(ui_surface: &UiSurface, log_fn: F) {
     let taffy_to_entity: HashMap<Node, Entity> = ui_surface
         .entity_to_taffy
         .iter()
-        .map(|(entity, node)| (*node, *entity))
-        .collect();
-    for (&entity, roots) in &ui_surface.camera_roots {
-        let mut out = String::new();
-        for root in roots {
+        .map(|(&ui_entity, &taffy_node)| (taffy_node, ui_entity))
+        .collect::<HashMap<Node, Entity>>();
+    for (&camera_entity, root_node_set) in ui_surface.camera_root_nodes.iter() {
+        log_fn(format!("Layout tree for camera entity: {camera_entity}"));
+        for &root_node_entity in root_node_set.iter() {
+            let Some(implicit_viewport_node) = ui_surface
+                .ui_root_node_meta
+                .get(&root_node_entity)
+                .map(|meta| meta.root_node_pair.implicit_viewport_node)
+            else {
+                continue;
+            };
+            let mut out = String::new();
             print_node(
                 ui_surface,
                 &taffy_to_entity,
-                entity,
-                root.implicit_viewport_node,
+                camera_entity,
+                implicit_viewport_node,
                 false,
                 String::new(),
                 &mut out,
             );
+
+            log_fn(out);
         }
-        bevy_utils::tracing::info!("Layout tree for camera entity: {entity:?}\n{out}");
     }
 }
 
@@ -59,7 +68,7 @@ fn print_node(
     };
     writeln!(
         acc,
-        "{lines}{fork} {display} [x: {x:<4} y: {y:<4} width: {width:<4} height: {height:<4}] ({entity:?}) {measured}",
+        "{lines}{fork} {display} [x: {x:<4} y: {y:<4} width: {width:<4} height: {height:<4}] ({entity}) {measured}",
         lines = lines_string,
         fork = fork_string,
         display = display_variant,

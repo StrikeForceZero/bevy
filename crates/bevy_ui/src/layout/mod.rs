@@ -1,14 +1,19 @@
 mod convert;
 pub mod debug;
+pub mod ui_surface;
 
+use crate::debug::print_ui_layout_tree;
+use crate::layout::ui_surface::UiSurface;
 use crate::{ContentSize, DefaultUiCamera, Node, Outline, Style, TargetCamera, UiScale};
+use bevy_ecs::prelude::Added;
+use bevy_ecs::query::Has;
 use bevy_ecs::{
     change_detection::{DetectChanges, DetectChangesMut},
-    entity::{Entity, EntityHashMap},
+    entity::Entity,
     event::EventReader,
     query::{With, Without},
     removal_detection::RemovedComponents,
-    system::{Query, Res, ResMut, Resource, SystemParam},
+    system::{Query, Res, ResMut, SystemParam},
     world::Ref,
 };
 use bevy_hierarchy::{Children, Parent};
@@ -16,12 +21,11 @@ use bevy_math::{UVec2, Vec2};
 use bevy_render::camera::{Camera, NormalizedRenderTarget};
 use bevy_transform::components::Transform;
 use bevy_utils::tracing::warn;
-use bevy_utils::{default, HashMap, HashSet};
+use bevy_utils::{HashMap, HashSet};
 use bevy_window::{PrimaryWindow, Window, WindowScaleFactorChanged};
-use std::fmt;
-use taffy::{tree::LayoutTree, Taffy};
 use thiserror::Error;
 
+#[derive(Debug)]
 pub struct LayoutContext {
     pub scale_factor: f32,
     pub physical_size: Vec2,
@@ -41,218 +45,6 @@ impl LayoutContext {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RootNodePair {
-    // The implicit "viewport" node created by Bevy
-    implicit_viewport_node: taffy::node::Node,
-    // The root (parentless) node specified by the user
-    user_root_node: taffy::node::Node,
-}
-
-#[derive(Resource)]
-pub struct UiSurface {
-    entity_to_taffy: EntityHashMap<taffy::node::Node>,
-    camera_entity_to_taffy: EntityHashMap<EntityHashMap<taffy::node::Node>>,
-    camera_roots: EntityHashMap<Vec<RootNodePair>>,
-    taffy: Taffy,
-}
-
-fn _assert_send_sync_ui_surface_impl_safe() {
-    fn _assert_send_sync<T: Send + Sync>() {}
-    _assert_send_sync::<EntityHashMap<taffy::node::Node>>();
-    _assert_send_sync::<Taffy>();
-    _assert_send_sync::<UiSurface>();
-}
-
-impl fmt::Debug for UiSurface {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("UiSurface")
-            .field("entity_to_taffy", &self.entity_to_taffy)
-            .field("camera_roots", &self.camera_roots)
-            .finish()
-    }
-}
-
-impl Default for UiSurface {
-    fn default() -> Self {
-        let mut taffy = Taffy::new();
-        taffy.disable_rounding();
-        Self {
-            entity_to_taffy: Default::default(),
-            camera_entity_to_taffy: Default::default(),
-            camera_roots: Default::default(),
-            taffy,
-        }
-    }
-}
-
-impl UiSurface {
-    /// Retrieves the Taffy node associated with the given UI node entity and updates its style.
-    /// If no associated Taffy node exists a new Taffy node is inserted into the Taffy layout.
-    pub fn upsert_node(&mut self, entity: Entity, style: &Style, context: &LayoutContext) {
-        let mut added = false;
-        let taffy = &mut self.taffy;
-        let taffy_node = self.entity_to_taffy.entry(entity).or_insert_with(|| {
-            added = true;
-            taffy.new_leaf(convert::from_style(context, style)).unwrap()
-        });
-
-        if !added {
-            self.taffy
-                .set_style(*taffy_node, convert::from_style(context, style))
-                .unwrap();
-        }
-    }
-
-    /// Update the `MeasureFunc` of the taffy node corresponding to the given [`Entity`] if the node exists.
-    pub fn try_update_measure(
-        &mut self,
-        entity: Entity,
-        measure_func: taffy::node::MeasureFunc,
-    ) -> Option<()> {
-        let taffy_node = self.entity_to_taffy.get(&entity)?;
-
-        self.taffy.set_measure(*taffy_node, Some(measure_func)).ok()
-    }
-
-    /// Update the children of the taffy node corresponding to the given [`Entity`].
-    pub fn update_children(&mut self, entity: Entity, children: &Children) {
-        let mut taffy_children = Vec::with_capacity(children.len());
-        for child in children {
-            if let Some(taffy_node) = self.entity_to_taffy.get(child) {
-                taffy_children.push(*taffy_node);
-            } else {
-                warn!(
-                    "Unstyled child in a UI entity hierarchy. You are using an entity \
-without UI components as a child of an entity with UI components, results may be unexpected."
-                );
-            }
-        }
-
-        let taffy_node = self.entity_to_taffy.get(&entity).unwrap();
-        self.taffy
-            .set_children(*taffy_node, &taffy_children)
-            .unwrap();
-    }
-
-    /// Removes children from the entity's taffy node if it exists. Does nothing otherwise.
-    pub fn try_remove_children(&mut self, entity: Entity) {
-        if let Some(taffy_node) = self.entity_to_taffy.get(&entity) {
-            self.taffy.set_children(*taffy_node, &[]).unwrap();
-        }
-    }
-
-    /// Removes the measure from the entity's taffy node if it exists. Does nothing otherwise.
-    pub fn try_remove_measure(&mut self, entity: Entity) {
-        if let Some(taffy_node) = self.entity_to_taffy.get(&entity) {
-            self.taffy.set_measure(*taffy_node, None).unwrap();
-        }
-    }
-
-    /// Set the ui node entities without a [`Parent`] as children to the root node in the taffy layout.
-    pub fn set_camera_children(
-        &mut self,
-        camera_id: Entity,
-        children: impl Iterator<Item = Entity>,
-    ) {
-        let viewport_style = taffy::style::Style {
-            display: taffy::style::Display::Grid,
-            // Note: Taffy percentages are floats ranging from 0.0 to 1.0.
-            // So this is setting width:100% and height:100%
-            size: taffy::geometry::Size {
-                width: taffy::style::Dimension::Percent(1.0),
-                height: taffy::style::Dimension::Percent(1.0),
-            },
-            align_items: Some(taffy::style::AlignItems::Start),
-            justify_items: Some(taffy::style::JustifyItems::Start),
-            ..default()
-        };
-
-        let camera_root_node_map = self.camera_entity_to_taffy.entry(camera_id).or_default();
-        let existing_roots = self.camera_roots.entry(camera_id).or_default();
-        let mut new_roots = Vec::new();
-        for entity in children {
-            let node = *self.entity_to_taffy.get(&entity).unwrap();
-            let root_node = existing_roots
-                .iter()
-                .find(|n| n.user_root_node == node)
-                .cloned()
-                .unwrap_or_else(|| {
-                    if let Some(previous_parent) = self.taffy.parent(node) {
-                        // remove the root node from the previous implicit node's children
-                        self.taffy.remove_child(previous_parent, node).unwrap();
-                    }
-
-                    let viewport_node = *camera_root_node_map
-                        .entry(entity)
-                        .or_insert_with(|| self.taffy.new_leaf(viewport_style.clone()).unwrap());
-                    self.taffy.add_child(viewport_node, node).unwrap();
-
-                    RootNodePair {
-                        implicit_viewport_node: viewport_node,
-                        user_root_node: node,
-                    }
-                });
-            new_roots.push(root_node);
-        }
-
-        self.camera_roots.insert(camera_id, new_roots);
-    }
-
-    /// Compute the layout for each window entity's corresponding root node in the layout.
-    pub fn compute_camera_layout(&mut self, camera: Entity, render_target_resolution: UVec2) {
-        let Some(camera_root_nodes) = self.camera_roots.get(&camera) else {
-            return;
-        };
-
-        let available_space = taffy::geometry::Size {
-            width: taffy::style::AvailableSpace::Definite(render_target_resolution.x as f32),
-            height: taffy::style::AvailableSpace::Definite(render_target_resolution.y as f32),
-        };
-        for root_nodes in camera_root_nodes {
-            self.taffy
-                .compute_layout(root_nodes.implicit_viewport_node, available_space)
-                .unwrap();
-        }
-    }
-
-    /// Removes each camera entity from the internal map and then removes their associated node from taffy
-    pub fn remove_camera_entities(&mut self, entities: impl IntoIterator<Item = Entity>) {
-        for entity in entities {
-            if let Some(camera_root_node_map) = self.camera_entity_to_taffy.remove(&entity) {
-                for (_, node) in camera_root_node_map.iter() {
-                    self.taffy.remove(*node).unwrap();
-                }
-            }
-        }
-    }
-
-    /// Removes each entity from the internal map and then removes their associated node from taffy
-    pub fn remove_entities(&mut self, entities: impl IntoIterator<Item = Entity>) {
-        for entity in entities {
-            if let Some(node) = self.entity_to_taffy.remove(&entity) {
-                self.taffy.remove(node).unwrap();
-            }
-        }
-    }
-
-    /// Get the layout geometry for the taffy node corresponding to the ui node [`Entity`].
-    /// Does not compute the layout geometry, `compute_window_layouts` should be run before using this function.
-    pub fn get_layout(&self, entity: Entity) -> Result<&taffy::layout::Layout, LayoutError> {
-        if let Some(taffy_node) = self.entity_to_taffy.get(&entity) {
-            self.taffy
-                .layout(*taffy_node)
-                .map_err(LayoutError::TaffyError)
-        } else {
-            warn!(
-                "Styled child in a non-UI entity hierarchy. You are using an entity \
-with UI components as a child of an entity without UI components, results may be unexpected."
-            );
-            Err(LayoutError::InvalidHierarchy)
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum LayoutError {
     #[error("Invalid hierarchy")]
@@ -264,6 +56,7 @@ pub enum LayoutError {
 #[derive(SystemParam)]
 pub struct UiLayoutSystemRemovedComponentParam<'w, 's> {
     removed_cameras: RemovedComponents<'w, 's, Camera>,
+    removed_parents: RemovedComponents<'w, 's, Parent>,
     removed_children: RemovedComponents<'w, 's, Children>,
     removed_content_sizes: RemovedComponents<'w, 's, ContentSize>,
     removed_nodes: RemovedComponents<'w, 's, Node>,
@@ -272,6 +65,7 @@ pub struct UiLayoutSystemRemovedComponentParam<'w, 's> {
 /// Updates the UI's layout tree, computes the new layout geometry and then updates the sizes and transforms of all the UI nodes.
 #[allow(clippy::too_many_arguments)]
 pub fn ui_layout_system(
+    mut total_nodes: bevy_ecs::prelude::Local<usize>,
     primary_window: Query<(Entity, &Window), With<PrimaryWindow>>,
     cameras: Query<(Entity, &Camera)>,
     default_ui_camera: DefaultUiCamera,
@@ -280,9 +74,10 @@ pub fn ui_layout_system(
     mut resize_events: EventReader<bevy_window::WindowResized>,
     mut ui_surface: ResMut<UiSurface>,
     root_node_query: Query<(Entity, Option<&TargetCamera>), (With<Node>, Without<Parent>)>,
-    style_query: Query<(Entity, Ref<Style>, Option<&TargetCamera>), With<Node>>,
+    style_query: Query<(Entity, Ref<Style>, Option<&TargetCamera>, Has<Parent>), With<Node>>,
     mut measure_query: Query<(Entity, &mut ContentSize)>,
     children_query: Query<(Entity, Ref<Children>), With<Node>>,
+    demote_to_child_query: Query<(Entity, Ref<Parent>), (With<Node>, Added<Parent>)>,
     just_children_query: Query<&Children>,
     mut removed_components: UiLayoutSystemRemovedComponentParam,
     mut node_transform_query: Query<(&mut Node, &mut Transform)>,
@@ -351,9 +146,9 @@ pub fn ui_layout_system(
     }
 
     // Resize all nodes
-    for (entity, style, target_camera) in style_query.iter() {
-        if let Some(camera) =
-            camera_with_default(target_camera).and_then(|c| camera_layout_info.get(&c))
+    for (entity, style, target_camera, has_parent) in style_query.iter() {
+        if let Some((camera_entity, camera)) = camera_with_default(target_camera)
+            .and_then(|c| camera_layout_info.get(&c).map(|clo| (c, clo)))
         {
             if camera.resized
                 || !scale_factor_events.is_empty()
@@ -364,7 +159,7 @@ pub fn ui_layout_system(
                     camera.scale_factor,
                     [camera.size.x as f32, camera.size.y as f32].into(),
                 );
-                ui_surface.upsert_node(entity, &style, &layout_context);
+                ui_surface.upsert_node(camera_entity, entity, &style, &layout_context, has_parent);
             }
         }
     }
@@ -378,6 +173,11 @@ pub fn ui_layout_system(
         if let Some(measure_func) = content_size.measure_func.take() {
             ui_surface.try_update_measure(entity, measure_func);
         }
+    }
+
+    for entity in removed_components.removed_parents.read() {
+        // TODO: fix - breaking tests
+        // ui_surface.promote_ui_node(&entity);
     }
 
     // clean up removed nodes
@@ -406,11 +206,16 @@ pub fn ui_layout_system(
             ui_surface.update_children(entity, &children);
         }
     }
+    for (entity, parent) in &demote_to_child_query {
+        if parent.is_added() {
+            ui_surface.demote_ui_node(&entity, &parent.get());
+        }
+    }
 
     for (camera_id, camera) in &camera_layout_info {
         let inverse_target_scale_factor = camera.scale_factor.recip();
 
-        ui_surface.compute_camera_layout(*camera_id, camera.size);
+        ui_surface.compute_camera_layout(camera_id, camera.size);
         for root in &camera.root_nodes {
             update_uinode_geometry_recursive(
                 *root,
@@ -473,6 +278,22 @@ pub fn ui_layout_system(
             }
         }
     }
+
+    // TODO: remove
+    if *total_nodes != ui_surface.taffy.total_node_count() {
+        *total_nodes = ui_surface.taffy.total_node_count();
+        println!("total_nodes: {:?}", *total_nodes);
+        for (entity, ui_meta) in ui_surface.ui_root_node_meta.iter() {
+            let camera_entity_string = ui_meta
+                .camera_entity
+                .map_or("None".to_string(), |v| v.to_string());
+            let user_root_node = ui_meta.root_node_pair.user_root_node;
+            let implicit_viewport_node = ui_meta.root_node_pair.implicit_viewport_node;
+            let children = ui_surface.taffy.child_count(user_root_node).unwrap();
+            println!("entity: {entity}, camera: {camera_entity_string}, root_node: {user_root_node:?}, viewport: {implicit_viewport_node:?}, children: {children}");
+        }
+        print_ui_layout_tree(&ui_surface, |s| println!("{s}"));
+    }
 }
 
 /// Resolve and update the widths of Node outlines
@@ -534,30 +355,34 @@ fn round_layout_coords(value: Vec2) -> Vec2 {
 #[cfg(test)]
 mod tests {
     use crate::layout::round_layout_coords;
+    use crate::layout::ui_surface::UiSurface;
     use crate::prelude::*;
     use crate::ui_layout_system;
     use crate::update::update_target_camera_system;
     use crate::ContentSize;
-    use crate::UiSurface;
     use bevy_asset::AssetEvent;
     use bevy_asset::Assets;
     use bevy_core_pipeline::core_2d::Camera2dBundle;
     use bevy_ecs::entity::Entity;
     use bevy_ecs::event::Events;
     use bevy_ecs::prelude::{Commands, Component, In, Query, With};
-    use bevy_ecs::query::Without;
+    use bevy_ecs::query::{QueryData, QueryEntityError, Without, WorldQuery};
     use bevy_ecs::schedule::apply_deferred;
     use bevy_ecs::schedule::IntoSystemConfigs;
     use bevy_ecs::schedule::Schedule;
     use bevy_ecs::system::RunSystemOnce;
     use bevy_ecs::world::World;
-    use bevy_hierarchy::{despawn_with_children_recursive, BuildWorldChildren, Children, Parent};
+    use bevy_hierarchy::{
+        despawn_with_children_recursive, BuildChildren, BuildWorldChildren, Children,
+        DespawnRecursiveExt, Parent,
+    };
     use bevy_math::{vec2, Rect, UVec2, Vec2};
-    use bevy_render::camera::ManualTextureViews;
     use bevy_render::camera::OrthographicProjection;
+    use bevy_render::camera::{ManualTextureViews, Viewport};
     use bevy_render::prelude::Camera;
     use bevy_render::texture::Image;
     use bevy_transform::prelude::{GlobalTransform, Transform};
+    use bevy_transform::systems::{propagate_transforms, sync_simple_transforms};
     use bevy_utils::prelude::default;
     use bevy_utils::HashMap;
     use bevy_window::PrimaryWindow;
@@ -566,6 +391,7 @@ mod tests {
     use bevy_window::WindowResized;
     use bevy_window::WindowResolution;
     use bevy_window::WindowScaleFactorChanged;
+    use std::fmt::Debug;
     use taffy::tree::LayoutTree;
 
     #[test]
@@ -607,6 +433,8 @@ mod tests {
                 update_target_camera_system,
                 apply_deferred,
                 ui_layout_system,
+                sync_simple_transforms,
+                propagate_transforms,
             )
                 .chain(),
         );
@@ -653,24 +481,53 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ui_surface_tracks_ui_entities() {
-        let (mut world, mut ui_schedule) = setup_ui_test_world();
-
-        ui_schedule.run(&mut world);
+    fn _track_ui_entity_setup(world: &mut World, ui_schedule: &mut Schedule) -> (Entity, Entity) {
+        ui_schedule.run(world);
 
         // no UI entities in world, none in UiSurface
         let ui_surface = world.resource::<UiSurface>();
-        assert!(ui_surface.entity_to_taffy.is_empty());
+        assert!(ui_surface.ui_root_node_meta.is_empty());
 
         let ui_entity = world.spawn(NodeBundle::default()).id();
 
         // `ui_layout_system` should map `ui_entity` to a ui node in `UiSurface::entity_to_taffy`
-        ui_schedule.run(&mut world);
+        ui_schedule.run(world);
 
         let ui_surface = world.resource::<UiSurface>();
         assert!(ui_surface.entity_to_taffy.contains_key(&ui_entity));
         assert_eq!(ui_surface.entity_to_taffy.len(), 1);
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity));
+        assert_eq!(ui_surface.ui_root_node_meta.len(), 1);
+
+        let child_entity = world.spawn(NodeBundle::default()).id();
+        world.commands().entity(ui_entity).add_child(child_entity);
+
+        // `ui_layout_system` should add `child_entity` as a child of `ui_entity`
+        ui_schedule.run(world);
+
+        let ui_surface = world.resource::<UiSurface>();
+        assert!(ui_surface.entity_to_taffy.contains_key(&child_entity));
+        assert_eq!(ui_surface.entity_to_taffy.len(), 2);
+        assert!(
+            !ui_surface.ui_root_node_meta.contains_key(&child_entity),
+            "child should not have been added as a root node"
+        );
+        assert_eq!(ui_surface.ui_root_node_meta.len(), 1);
+        let ui_taffy = ui_surface.entity_to_taffy.get(&ui_entity).unwrap();
+        let child_taffy = ui_surface.entity_to_taffy.get(&child_entity).unwrap();
+        assert_eq!(
+            ui_surface.taffy.parent(*child_taffy),
+            Some(*ui_taffy),
+            "expected to be child of root node"
+        );
+
+        (ui_entity, child_entity)
+    }
+
+    #[test]
+    fn ui_surface_tracks_ui_entities_despawn() {
+        let (mut world, mut ui_schedule) = setup_ui_test_world();
+        let (ui_entity, child_entity) = _track_ui_entity_setup(&mut world, &mut ui_schedule);
 
         world.despawn(ui_entity);
 
@@ -679,7 +536,100 @@ mod tests {
 
         let ui_surface = world.resource::<UiSurface>();
         assert!(!ui_surface.entity_to_taffy.contains_key(&ui_entity));
+        assert_eq!(ui_surface.entity_to_taffy.len(), 1);
+        assert!(!ui_surface.ui_root_node_meta.contains_key(&ui_entity));
+        assert!(ui_surface.ui_root_node_meta.is_empty());
+    }
+
+    #[test]
+    fn ui_surface_tracks_ui_entities_despawn_recursive() {
+        let (mut world, mut ui_schedule) = setup_ui_test_world();
+        let (ui_entity, child_entity) = _track_ui_entity_setup(&mut world, &mut ui_schedule);
+
+        despawn_with_children_recursive(&mut world, ui_entity);
+
+        // `ui_layout_system` should remove `ui_entity` and `child_entity` from `UiSurface::entity_to_taffy`
+        ui_schedule.run(&mut world);
+
+        let ui_surface = world.resource::<UiSurface>();
+        assert!(!ui_surface.entity_to_taffy.contains_key(&ui_entity));
         assert!(ui_surface.entity_to_taffy.is_empty());
+        assert!(!ui_surface.ui_root_node_meta.contains_key(&ui_entity));
+        assert!(ui_surface.ui_root_node_meta.is_empty());
+    }
+
+    #[test]
+    fn ui_surface_tracks_ui_entities_despawn_descendants() {
+        let (mut world, mut ui_schedule) = setup_ui_test_world();
+        let (ui_entity, child_entity) = _track_ui_entity_setup(&mut world, &mut ui_schedule);
+
+        world.commands().entity(ui_entity).despawn_descendants();
+
+        // `ui_layout_system` should remove `child_entity` from `UiSurface::entity_to_taffy`
+        ui_schedule.run(&mut world);
+
+        let ui_surface = world.resource::<UiSurface>();
+        assert!(ui_surface.entity_to_taffy.contains_key(&ui_entity));
+        assert_eq!(ui_surface.entity_to_taffy.len(), 1);
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity));
+        assert_eq!(ui_surface.ui_root_node_meta.len(), 1);
+    }
+
+    #[test]
+    fn ui_demotion_from_root_to_child() {
+        let (mut world, mut ui_schedule) = setup_ui_test_world();
+
+        let ui_entity1 = world.spawn(NodeBundle::default()).id();
+        let ui_entity2 = world.spawn(NodeBundle::default()).id();
+
+        ui_schedule.run(&mut world);
+
+        let ui_surface = world.resource::<UiSurface>();
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity1));
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity2));
+        assert_eq!(ui_surface.taffy.total_node_count(), 4);
+
+        world.commands().entity(ui_entity1).add_child(ui_entity2);
+
+        ui_schedule.run(&mut world);
+
+        let ui_surface = world.resource::<UiSurface>();
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity1));
+        assert!(!ui_surface.ui_root_node_meta.contains_key(&ui_entity2));
+        assert_eq!(ui_surface.taffy.total_node_count(), 3);
+        let taffy_parent = ui_surface.entity_to_taffy.get(&ui_entity1).unwrap();
+        let taffy_child = ui_surface.entity_to_taffy.get(&ui_entity2).unwrap();
+        assert_eq!(
+            ui_surface.taffy.parent(*taffy_child).unwrap(),
+            *taffy_parent
+        );
+    }
+
+    #[test]
+    fn ui_promotion_from_child_to_root() {
+        let (mut world, mut ui_schedule) = setup_ui_test_world();
+
+        let ui_entity1 = world.spawn(NodeBundle::default()).id();
+        let ui_entity2 = world.spawn(NodeBundle::default()).id();
+        world.commands().entity(ui_entity1).add_child(ui_entity2);
+
+        ui_schedule.run(&mut world);
+
+        let ui_surface = world.resource::<UiSurface>();
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity1));
+        assert!(!ui_surface.ui_root_node_meta.contains_key(&ui_entity2));
+        assert_eq!(ui_surface.taffy.total_node_count(), 3);
+
+        world.commands().entity(ui_entity2).remove_parent();
+
+        ui_schedule.run(&mut world);
+
+        let ui_surface = world.resource::<UiSurface>();
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity1));
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity2));
+        assert_eq!(ui_surface.taffy.total_node_count(), 4);
+        let taffy_child = ui_surface.entity_to_taffy.get(&ui_entity2).unwrap();
+        assert_eq!(ui_surface.taffy.parent(*taffy_child), None);
     }
 
     #[test]
@@ -699,7 +649,7 @@ mod tests {
 
         // no UI entities in world, none in UiSurface
         let ui_surface = world.resource::<UiSurface>();
-        assert!(ui_surface.camera_entity_to_taffy.is_empty());
+        assert!(ui_surface.ui_root_node_meta.is_empty());
 
         // respawn camera
         let camera_entity = world.spawn(Camera2dBundle::default()).id();
@@ -708,26 +658,22 @@ mod tests {
             .spawn((NodeBundle::default(), TargetCamera(camera_entity)))
             .id();
 
-        // `ui_layout_system` should map `camera_entity` to a ui node in `UiSurface::camera_entity_to_taffy`
+        // `ui_layout_system` should populate `UiSurface::entity_to_taffy`, `UiSurface::ui_root_node_meta`, and `UiSurface::camera_root_nodes`
         ui_schedule.run(&mut world);
 
         let ui_surface = world.resource::<UiSurface>();
-        assert!(ui_surface
-            .camera_entity_to_taffy
-            .contains_key(&camera_entity));
-        assert_eq!(ui_surface.camera_entity_to_taffy.len(), 1);
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity));
+        assert_eq!(ui_surface.ui_root_node_meta.len(), 1);
 
-        world.despawn(ui_entity);
+        // world.despawn(ui_entity);
         world.despawn(camera_entity);
 
-        // `ui_layout_system` should remove `camera_entity` from `UiSurface::camera_entity_to_taffy`
+        // `ui_layout_system` should remove camera from `UiSurface::camera_root_nodes`
         ui_schedule.run(&mut world);
 
         let ui_surface = world.resource::<UiSurface>();
-        assert!(!ui_surface
-            .camera_entity_to_taffy
-            .contains_key(&camera_entity));
-        assert!(ui_surface.camera_entity_to_taffy.is_empty());
+        assert!(!ui_surface.ui_root_node_meta.contains_key(&ui_entity));
+        assert!(ui_surface.ui_root_node_meta.is_empty());
     }
 
     #[test]
@@ -742,7 +688,10 @@ mod tests {
 
         // retrieve the ui node corresponding to `ui_entity` from ui surface
         let ui_surface = world.resource::<UiSurface>();
-        let ui_node = ui_surface.entity_to_taffy[&ui_entity];
+        let ui_node = *ui_surface
+            .entity_to_taffy
+            .get(&ui_entity)
+            .expect("missing root node pair");
 
         world.despawn(ui_entity);
 
@@ -856,6 +805,7 @@ mod tests {
         // all nodes should have been deleted
         let ui_surface = world.resource::<UiSurface>();
         assert!(ui_surface.entity_to_taffy.is_empty());
+        assert_eq!(ui_surface.taffy.total_node_count(), 0);
     }
 
     /// regression test for >=0.13.1 root node layouts
@@ -905,15 +855,11 @@ mod tests {
         ui_schedule.run(&mut world);
 
         let overlap_check = world
-            .query_filtered::<(Entity, &Node, &mut GlobalTransform, &Transform), Without<Parent>>()
+            .query_filtered::<(Entity, &Node, &GlobalTransform), Without<Parent>>()
             .iter_mut(&mut world)
             .fold(
                 Option::<(Rect, bool)>::None,
-                |option_rect, (entity, node, mut global_transform, transform)| {
-                    // fix global transform - for some reason the global transform isn't populated yet.
-                    // might be related to how these specific tests are working directly with World instead of App
-                    *global_transform = GlobalTransform::from(transform.compute_affine());
-                    let global_transform = &*global_transform;
+                |option_rect, (entity, node, global_transform)| {
                     let current_rect = node.logical_rect(global_transform);
                     assert!(
                         current_rect.height().abs() + current_rect.width().abs() > 0.,
@@ -941,32 +887,31 @@ mod tests {
         assert!(is_overlapping, "root ui nodes are expected to behave like they have absolute position and be independent from each other");
     }
 
+    fn _update_camera_viewports(
+        primary_window_query: Query<&Window, With<PrimaryWindow>>,
+        mut cameras: Query<&mut Camera>,
+    ) {
+        let primary_window = primary_window_query
+            .get_single()
+            .expect("missing primary window");
+        let camera_count = cameras.iter().len();
+        for (camera_index, mut camera) in cameras.iter_mut().enumerate() {
+            let viewport_width = primary_window.resolution.physical_width() / camera_count as u32;
+            let viewport_height = primary_window.resolution.physical_height();
+            let physical_position = UVec2::new(viewport_width * camera_index as u32, 0);
+            let physical_size = UVec2::new(viewport_width, viewport_height);
+            camera.viewport = Some(bevy_render::camera::Viewport {
+                physical_position,
+                physical_size,
+                ..default()
+            });
+        }
+    }
+
     #[test]
     fn ui_node_should_properly_update_when_changing_target_camera() {
         #[derive(Component)]
         struct MovingUiNode;
-
-        fn update_camera_viewports(
-            primary_window_query: Query<&Window, With<PrimaryWindow>>,
-            mut cameras: Query<&mut Camera>,
-        ) {
-            let primary_window = primary_window_query
-                .get_single()
-                .expect("missing primary window");
-            let camera_count = cameras.iter().len();
-            for (camera_index, mut camera) in cameras.iter_mut().enumerate() {
-                let viewport_width =
-                    primary_window.resolution.physical_width() / camera_count as u32;
-                let viewport_height = primary_window.resolution.physical_height();
-                let physical_position = UVec2::new(viewport_width * camera_index as u32, 0);
-                let physical_size = UVec2::new(viewport_width, viewport_height);
-                camera.viewport = Some(bevy_render::camera::Viewport {
-                    physical_position,
-                    physical_size,
-                    ..default()
-                });
-            }
-        }
 
         fn move_ui_node(
             In(pos): In<Vec2>,
@@ -1055,7 +1000,7 @@ mod tests {
         // add total cameras - 1 (the assumed default) to get an idea for how many nodes we should expect
         let expected_max_taffy_node_count = get_taffy_node_count(&world) + total_cameras - 1;
 
-        world.run_system_once(update_camera_viewports);
+        world.run_system_once(_update_camera_viewports);
 
         ui_schedule.run(&mut world);
 
@@ -1134,7 +1079,10 @@ mod tests {
         ui_schedule.run(&mut world);
 
         let ui_surface = world.resource::<UiSurface>();
-        let ui_node = ui_surface.entity_to_taffy[&ui_entity];
+        let ui_node = *ui_surface
+            .entity_to_taffy
+            .get(&ui_entity)
+            .expect("missing root node pair");
 
         // a node with a content size needs to be measured
         assert!(ui_surface.taffy.needs_measure(ui_node));
@@ -1207,6 +1155,726 @@ mod tests {
                 assert!((width_sum - 320.).abs() <= 1.);
                 s += r;
             }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct LeftRightCameraEntity {
+        left: Entity,
+        right: Entity,
+    }
+    fn _multi_camera_setup(world: &mut World) -> LeftRightCameraEntity {
+        let left_camera_entity = world
+            .query_filtered::<Entity, With<Camera>>()
+            .get_single(&world)
+            .expect("missing camera");
+        let right_camera_entity = world
+            .spawn(Camera2dBundle {
+                camera: Camera {
+                    order: 1,
+                    ..default()
+                },
+                ..default()
+            })
+            .id();
+        LeftRightCameraEntity {
+            left: left_camera_entity,
+            right: right_camera_entity,
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct PartialLeftRightCameraEntity {
+        left: Option<Entity>,
+        right: Option<Entity>,
+    }
+
+    impl From<LeftRightCameraEntity> for PartialLeftRightCameraEntity {
+        fn from(value: LeftRightCameraEntity) -> Self {
+            Self {
+                left: Some(value.left),
+                right: Some(value.right),
+            }
+        }
+    }
+
+    trait IsLargerThan<T> {
+        fn is_larger_than(&self, other: T) -> bool;
+    }
+
+    impl IsLargerThan<Rect> for Rect {
+        fn is_larger_than(&self, other: Rect) -> bool {
+            self.height() > other.height() && self.width() > other.width()
+        }
+    }
+
+    trait IsSameSizeAs<T> {
+        fn is_same_size_as(&self, other: T) -> bool;
+    }
+
+    impl IsSameSizeAs<Rect> for Rect {
+        fn is_same_size_as(&self, other: Rect) -> bool {
+            self.height() == other.height() && self.width() == other.width()
+        }
+    }
+
+    trait HasPositiveArea<T> {
+        fn has_positive_area(&self) -> bool;
+    }
+
+    impl HasPositiveArea<Rect> for Rect {
+        fn has_positive_area(&self) -> bool {
+            self.height() > 0. && self.width() > 0.
+        }
+    }
+
+    trait ShiftBy<T, V> {
+        fn shift_by(&self, amount: V) -> T;
+    }
+
+    impl ShiftBy<Rect, Rect> for Rect {
+        fn shift_by(&self, amount: Rect) -> Rect {
+            Rect::from_corners(self.min + amount.min, self.max + amount.min)
+        }
+    }
+
+    trait SplitAt<T, V> {
+        fn split_at(&self, split: V) -> (T, T);
+    }
+    trait SplitHalf<T, V> {
+        fn split_half(&self, split: V) -> (T, T);
+    }
+
+    enum SplitHalfAxis {
+        X,
+        Y,
+    }
+    impl SplitHalf<Rect, SplitHalfAxis> for Rect {
+        fn split_half(&self, split: SplitHalfAxis) -> (Rect, Rect) {
+            match split {
+                SplitHalfAxis::X => {
+                    let mid_x = self.center().x;
+                    (
+                        Rect::from_corners(self.min, Vec2::new(mid_x, self.max.y)),
+                        Rect::from_corners(Vec2::new(mid_x, self.min.y), self.max),
+                    )
+                }
+                SplitHalfAxis::Y => {
+                    let mid_y = self.center().y;
+                    (
+                        Rect::from_corners(self.min, Vec2::new(self.max.x, mid_y)),
+                        Rect::from_corners(Vec2::new(self.min.x, mid_y), self.max),
+                    )
+                }
+            }
+        }
+    }
+
+    enum SplitAtAxis {
+        X(f32),
+        Y(f32),
+    }
+    impl SplitAt<Rect, SplitAtAxis> for Rect {
+        fn split_at(&self, split: SplitAtAxis) -> (Rect, Rect) {
+            match split {
+                SplitAtAxis::X(x) => (
+                    Rect::from_corners(self.min, Vec2::new(self.min.x + x, self.max.y)),
+                    Rect::from_corners(self.min + Vec2::new(x, 0.), self.max),
+                ),
+                SplitAtAxis::Y(y) => (
+                    Rect::from_corners(self.min, Vec2::new(self.max.x, self.min.y + y)),
+                    Rect::from_corners(self.min + Vec2::new(0., y), self.max),
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_rect_split_in_half() {
+        let rect = Rect::from_corners(Vec2::ZERO, Vec2::ONE);
+        assert_eq!(
+            rect.split_at(SplitAtAxis::Y(0.0)),
+            (
+                Rect::from_corners(Vec2::ZERO, Vec2::new(1., 0.)),
+                Rect::from_corners(Vec2::ZERO, Vec2::ONE),
+            )
+        );
+        assert_eq!(
+            rect.split_at(SplitAtAxis::Y(0.5)),
+            (
+                Rect::from_corners(Vec2::ZERO, Vec2::new(1.0, 0.5)),
+                Rect::from_corners(Vec2::new(0.0, 0.5), Vec2::ONE),
+            )
+        );
+        assert_eq!(
+            rect.split_at(SplitAtAxis::Y(1.0)),
+            (
+                Rect::from_corners(Vec2::ZERO, Vec2::ONE),
+                Rect::from_corners(Vec2::new(0.0, 1.0), Vec2::ONE),
+            )
+        );
+
+        assert_eq!(
+            rect.split_at(SplitAtAxis::X(0.0)),
+            (
+                Rect::from_corners(Vec2::ZERO, Vec2::new(0.0, 1.0)),
+                Rect::from_corners(Vec2::ZERO, Vec2::ONE),
+            )
+        );
+        assert_eq!(
+            rect.split_at(SplitAtAxis::X(0.5)),
+            (
+                Rect::from_corners(Vec2::ZERO, Vec2::new(0.5, 1.0)),
+                Rect::from_corners(Vec2::new(0.5, 0.0), Vec2::ONE),
+            )
+        );
+        assert_eq!(
+            rect.split_at(SplitAtAxis::X(1.0)),
+            (
+                Rect::from_corners(Vec2::ZERO, Vec2::ONE),
+                Rect::from_corners(Vec2::new(1.0, 0.0), Vec2::ONE),
+            )
+        );
+    }
+
+    // TODO: this test and its "helpers" might be over the top and should be condensed
+    trait PhysicalRect {
+        fn get_rect(&self) -> Rect;
+    }
+
+    trait PhysicalRectOption {
+        fn get_rect(&self) -> Option<Rect>;
+    }
+
+    impl PhysicalRect for Window {
+        fn get_rect(&self) -> Rect {
+            Rect::from_corners(Vec2::ZERO, self.resolution.physical_size().as_vec2())
+        }
+    }
+
+    impl PhysicalRect for Viewport {
+        fn get_rect(&self) -> Rect {
+            let p_pos = self.physical_position;
+            let p_size = self.physical_size;
+            Rect::from_corners(p_pos.as_vec2(), (p_pos + p_size).as_vec2())
+        }
+    }
+
+    #[derive(Debug, Component)]
+    struct CustomIdMarker(&'static str);
+
+    #[derive(Debug)]
+    struct BaseExoticMultiCameraSetupRef<C: Debug, E: Debug> {
+        cameras: C,
+
+        ui_left_1: E,
+        ui_left_1a: E,
+
+        ui_right_1: E,
+        ui_right_1a: E,
+        ui_right_1b: E,
+
+        ui_right_2: E,
+        ui_right_2a: E,
+        ui_right_2b: E,
+    }
+
+    #[derive(Debug)]
+    struct ExoticMultiCameraSetupRef<'a> {
+        world: &'a mut World,
+        initial: BaseExoticMultiCameraSetupRef<LeftRightCameraEntity, Entity>,
+        state: BaseExoticMultiCameraSetupRef<PartialLeftRightCameraEntity, Option<Entity>>,
+    }
+
+    macro_rules! validate_single_params {
+        ($self:expr, $field1:ident, $field2:ident) => {
+            (
+                concat!(stringify!($field1), ".", stringify!($field2)),
+                $self.initial.$field1.$field2.clone(),
+                $self.state.$field1.$field2.clone(),
+            )
+        };
+        ($self:expr, $field1:ident) => {
+            (
+                stringify!($field1),
+                $self.initial.$field1.clone(),
+                $self.state.$field1.clone(),
+            )
+        };
+    }
+
+    impl<'a> ExoticMultiCameraSetupRef<'a> {
+        fn from_populated_base(
+            world: &'a mut World,
+            base: BaseExoticMultiCameraSetupRef<PartialLeftRightCameraEntity, Option<Entity>>,
+        ) -> Self {
+            assert!(base.ui_left_1.is_some(), "missing ui_left_1");
+            assert!(base.ui_left_1a.is_some(), "missing ui_left_1a");
+            assert!(base.ui_right_1.is_some(), "missing ui_right_1");
+            assert!(base.ui_right_1a.is_some(), "missing ui_right_1a");
+            assert!(base.ui_right_1b.is_some(), "missing ui_right_1b");
+            assert!(base.ui_right_2.is_some(), "missing ui_right_2");
+            assert!(base.ui_right_2a.is_some(), "missing ui_right_2a");
+            assert!(base.ui_right_2b.is_some(), "missing ui_right_2b");
+            Self {
+                world,
+                initial: BaseExoticMultiCameraSetupRef::<LeftRightCameraEntity, Entity> {
+                    cameras: LeftRightCameraEntity {
+                        left: base.cameras.left.unwrap(),
+                        right: base.cameras.right.unwrap(),
+                    },
+                    ui_left_1: base.ui_left_1.unwrap(),
+                    ui_left_1a: base.ui_left_1a.unwrap(),
+                    ui_right_1: base.ui_right_1.unwrap(),
+                    ui_right_1a: base.ui_right_1a.unwrap(),
+                    ui_right_1b: base.ui_right_1b.unwrap(),
+                    ui_right_2: base.ui_right_2.unwrap(),
+                    ui_right_2a: base.ui_right_2a.unwrap(),
+                    ui_right_2b: base.ui_right_2b.unwrap(),
+                },
+                state: base,
+            }
+        }
+
+        fn single_validate<'b, Q, F>(
+            &'b mut self,
+            params: (&'static str, Entity, Option<Entity>),
+            custom_validate: F,
+        ) where
+            Q: QueryData<ReadOnly = Q> + 'b,
+            F: FnOnce(&str, <Q as WorldQuery>::Item<'b>),
+        {
+            let (label, initial, state) = params;
+            let expects_to_exist = state.is_some();
+
+            match self.world.query::<Q>().get(self.world, initial) {
+                Ok(component) => {
+                    assert!(
+                        expects_to_exist,
+                        "{label}: Entity {initial} was not expected to exist anymore!"
+                    );
+                    custom_validate(label, component);
+                }
+                Err(err) => {
+                    match err {
+                        QueryEntityError::QueryDoesNotMatch(_)
+                        | QueryEntityError::AliasedMutability(_) => {
+                            panic!("{label}: query failed, bad test setup - {err:?}")
+                        }
+                        QueryEntityError::NoSuchEntity(_) => {}
+                    }
+                    assert!(
+                        !expects_to_exist,
+                        "{label}: Entity {initial} was expected to still exist!"
+                    );
+                }
+            }
+        }
+
+        fn validate(&mut self) {
+            let primary_window = self
+                .world
+                .query_filtered::<&Window, With<PrimaryWindow>>()
+                .get_single(self.world)
+                .expect("missing primary window");
+            let window_rect = primary_window.get_rect();
+            assert!(window_rect.has_positive_area());
+            let window_center = window_rect.center();
+
+            let mut left_rect = Rect::default();
+            let mut right_rect = Rect::default();
+
+            self.single_validate::<(&Camera), _>(
+                validate_single_params!(self, cameras, left),
+                |label, (c)| {
+                    left_rect = c.logical_viewport_rect().unwrap();
+                    assert_eq!(
+                        left_rect,
+                        window_rect.split_at(SplitAtAxis::X(window_center.x)).0,
+                        "{label} not in expected bounds"
+                    );
+                },
+            );
+            if self.state.cameras.left.is_some() {
+                assert!(left_rect.has_positive_area());
+            }
+            self.single_validate::<(&Camera), _>(
+                validate_single_params!(self, cameras, right),
+                |label, (c)| {
+                    right_rect = c.logical_viewport_rect().unwrap();
+                    assert_eq!(
+                        right_rect,
+                        window_rect.split_at(SplitAtAxis::X(window_center.x)).1,
+                        "{label} not in expected bounds"
+                    );
+                },
+            );
+            if self.state.cameras.right.is_some() {
+                assert!(right_rect.has_positive_area());
+            }
+
+            // these assume nothing has been removed
+            self.single_validate::<(&Node, &GlobalTransform), _>(
+                validate_single_params!(self, ui_left_1),
+                |label, (n, g)| {
+                    assert_eq!(
+                        n.logical_rect(g).shift_by(left_rect),
+                        left_rect,
+                        "{label} not in expected bounds"
+                    );
+                },
+            );
+            self.single_validate::<(&Node, &GlobalTransform, &Transform), _>(
+                validate_single_params!(self, ui_left_1a),
+                |label, (n, g, t)| {
+                    assert_eq!(
+                        n.logical_rect(g).shift_by(left_rect),
+                        left_rect,
+                        "{label} not in expected bounds"
+                    );
+                },
+            );
+            self.single_validate::<(&Node, &GlobalTransform), _>(
+                validate_single_params!(self, ui_right_1),
+                |label, (n, g)| {
+                    assert_eq!(
+                        n.logical_rect(g).shift_by(right_rect),
+                        right_rect.split_half(SplitHalfAxis::Y).0,
+                        "{label} not in expected bounds"
+                    );
+                },
+            );
+            self.single_validate::<(&Node, &GlobalTransform, &Transform), _>(
+                validate_single_params!(self, ui_right_1a),
+                |label, (n, g, t)| {
+                    assert_eq!(
+                        n.logical_rect(g).shift_by(right_rect),
+                        right_rect
+                            .split_half(SplitHalfAxis::Y)
+                            .0
+                            .split_half(SplitHalfAxis::Y)
+                            .0,
+                        "{label} not in expected bounds"
+                    );
+                },
+            );
+            self.single_validate::<(&Node, &GlobalTransform, &Transform), _>(
+                validate_single_params!(self, ui_right_1b),
+                |label, (n, g, t)| {
+                    assert_eq!(
+                        n.logical_rect(g).shift_by(right_rect),
+                        right_rect
+                            .split_half(SplitHalfAxis::Y)
+                            .0
+                            .split_half(SplitHalfAxis::Y)
+                            .1,
+                        "{label} not in expected bounds"
+                    );
+                },
+            );
+            self.single_validate::<(&Node, &GlobalTransform), _>(
+                validate_single_params!(self, ui_right_2),
+                |label, (n, g)| {
+                    assert_eq!(
+                        n.logical_rect(g).shift_by(right_rect),
+                        right_rect.split_half(SplitHalfAxis::Y).1,
+                        "{label} not in expected bounds"
+                    );
+                },
+            );
+            self.single_validate::<(&Node, &GlobalTransform), _>(
+                validate_single_params!(self, ui_right_2a),
+                |label, (n, g)| {
+                    assert_eq!(
+                        n.logical_rect(g).shift_by(right_rect),
+                        right_rect
+                            .split_half(SplitHalfAxis::Y)
+                            .1
+                            .split_half(SplitHalfAxis::Y)
+                            .0,
+                        "{label} not in expected bounds"
+                    );
+                },
+            );
+            self.single_validate::<(&Node, &GlobalTransform), _>(
+                validate_single_params!(self, ui_right_2b),
+                |label, (n, g)| {
+                    assert_eq!(
+                        n.logical_rect(g).shift_by(right_rect),
+                        right_rect
+                            .split_half(SplitHalfAxis::Y)
+                            .1
+                            .split_half(SplitHalfAxis::Y)
+                            .1,
+                        "{label} not in expected bounds"
+                    );
+                },
+            );
+
+            // each root node creates an extra implicit viewport node, so we need to account for those
+            let root_node_count = self
+                .world
+                .query_filtered::<&Node, Without<Parent>>()
+                .iter(self.world)
+                .len();
+
+            // loosely validate taffy state (node count)
+            let left = vec![self.state.ui_left_1, self.state.ui_left_1a];
+            let right = vec![
+                self.state.ui_right_1,
+                self.state.ui_right_1a,
+                self.state.ui_right_1b,
+                self.state.ui_right_2,
+                self.state.ui_right_2a,
+                self.state.ui_right_2b,
+            ];
+            let mut all_items = left.clone();
+            all_items.append(&mut right.clone());
+
+            let total_node_count = all_items.len() + root_node_count;
+            let nodes_alive_count = all_items
+                .iter()
+                .fold(0, |sum, item| sum + item.is_some() as usize)
+                + root_node_count;
+            let mut expected_node_count_negative_offset = 0;
+            if self.state.cameras.left.is_none() {
+                expected_node_count_negative_offset += left.len();
+            }
+            if self.state.cameras.right.is_none() {
+                expected_node_count_negative_offset += right.len();
+            }
+
+            let expected_node_count =
+                (total_node_count - expected_node_count_negative_offset).min(nodes_alive_count);
+
+            assert_eq!(
+                self.world.resource::<UiSurface>().taffy.total_node_count(),
+                expected_node_count
+            );
+        }
+    }
+
+    fn _exotic_multi_camera_ui_setup(
+        world: &mut World,
+        cameras: LeftRightCameraEntity,
+    ) -> ExoticMultiCameraSetupRef {
+        let mut res = BaseExoticMultiCameraSetupRef::<PartialLeftRightCameraEntity, Option<Entity>> {
+            cameras: cameras.clone().into(),
+            ui_left_1: None,
+            ui_left_1a: None,
+            ui_right_1: None,
+            ui_right_1a: None,
+            ui_right_1b: None,
+            ui_right_2: None,
+            ui_right_2a: None,
+            ui_right_2b: None,
+        };
+
+        res.ui_left_1 = Some(
+            world
+                .spawn((
+                    CustomIdMarker("L:1"),
+                    NodeBundle {
+                        style: Style {
+                            flex_direction: FlexDirection::Column,
+                            width: Val::Percent(100.),
+                            height: Val::Percent(100.),
+                            ..default()
+                        },
+                        ..default()
+                    },
+                    TargetCamera(cameras.left),
+                ))
+                .with_children(|children| {
+                    res.ui_left_1a = Some(
+                        children
+                            .spawn((
+                                CustomIdMarker("L:1A"),
+                                NodeBundle {
+                                    style: Style {
+                                        width: Val::Percent(100.),
+                                        height: Val::Percent(100.),
+                                        ..default()
+                                    },
+                                    ..default()
+                                },
+                            ))
+                            .id(),
+                    );
+                })
+                .id(),
+        );
+
+        res.ui_right_1 = Some(
+            world
+                .spawn((
+                    CustomIdMarker("R:1"),
+                    NodeBundle {
+                        style: Style {
+                            flex_direction: FlexDirection::Column,
+                            width: Val::Percent(100.),
+                            height: Val::Percent(50.),
+                            ..default()
+                        },
+                        ..default()
+                    },
+                    TargetCamera(cameras.right),
+                ))
+                .with_children(|children| {
+                    res.ui_right_1a = Some(
+                        children
+                            .spawn((
+                                CustomIdMarker("R:1A"),
+                                NodeBundle {
+                                    style: Style {
+                                        width: Val::Percent(100.),
+                                        height: Val::Percent(50.),
+                                        ..default()
+                                    },
+                                    ..default()
+                                },
+                            ))
+                            .id(),
+                    );
+                    res.ui_right_1b = Some(
+                        children
+                            .spawn((
+                                CustomIdMarker("R:1B"),
+                                NodeBundle {
+                                    style: Style {
+                                        width: Val::Percent(100.),
+                                        height: Val::Percent(50.),
+                                        ..default()
+                                    },
+                                    ..default()
+                                },
+                            ))
+                            .id(),
+                    );
+                })
+                .id(),
+        );
+
+        res.ui_right_2 = Some(
+            world
+                .spawn((
+                    CustomIdMarker("R:2"),
+                    NodeBundle {
+                        style: Style {
+                            flex_direction: FlexDirection::Column,
+                            width: Val::Percent(100.),
+                            height: Val::Percent(50.),
+                            top: Val::Percent(50.),
+                            ..default()
+                        },
+                        ..default()
+                    },
+                    TargetCamera(cameras.right),
+                ))
+                .with_children(|children| {
+                    res.ui_right_2a = Some(
+                        children
+                            .spawn((
+                                NodeBundle {
+                                    style: Style {
+                                        width: Val::Percent(100.),
+                                        height: Val::Percent(50.),
+                                        ..default()
+                                    },
+                                    ..default()
+                                },
+                                CustomIdMarker("R:2A"),
+                            ))
+                            .id(),
+                    );
+                    res.ui_right_2b = Some(
+                        children
+                            .spawn((
+                                CustomIdMarker("R:2B"),
+                                NodeBundle {
+                                    style: Style {
+                                        width: Val::Percent(100.),
+                                        height: Val::Percent(50.),
+                                        ..default()
+                                    },
+                                    ..default()
+                                },
+                            ))
+                            .id(),
+                    );
+                })
+                .id(),
+        );
+
+        ExoticMultiCameraSetupRef::from_populated_base(world, res)
+    }
+
+    #[test]
+    fn test_layouts_for_correctness() {
+        let (mut world, mut ui_schedule) = setup_ui_test_world();
+        let left_right_camera_entity = _multi_camera_setup(&mut world);
+
+        world.run_system_once(_update_camera_viewports);
+
+        let mut instance = _exotic_multi_camera_ui_setup(&mut world, left_right_camera_entity);
+        ui_schedule.run(instance.world);
+        instance.validate();
+
+        instance
+            .world
+            .commands()
+            .entity(instance.initial.ui_right_1)
+            .insert(TargetCamera(instance.initial.cameras.left));
+
+        ui_schedule.run(instance.world);
+        // TODO: make validate able to check when right points to left camera
+        // instance.validate();
+    }
+
+    #[test]
+    fn test_extraneous_taffy_node_creation() {
+        let (mut world, mut ui_schedule) = setup_ui_test_world();
+        let left_right_camera_entity = _multi_camera_setup(&mut world);
+
+        world.run_system_once(_update_camera_viewports);
+
+        let mut instance = _exotic_multi_camera_ui_setup(&mut world, left_right_camera_entity);
+
+        ui_schedule.run(instance.world);
+        instance.validate();
+
+        let ui_surface = instance.world.get_resource::<UiSurface>().unwrap();
+
+        let highest_node = ui_surface
+            .entity_to_taffy
+            .iter()
+            .fold(
+                Option::<taffy::node::Node>::None,
+                |option_highest, (_, &next_node)| {
+                    let mut cur_highest = option_highest.unwrap_or(next_node);
+                    if cur_highest < next_node {
+                        cur_highest = next_node;
+                    }
+                    Some(cur_highest)
+                },
+            )
+            .expect("nothing in scene");
+
+        ui_schedule.run(instance.world);
+        let ui_surface = instance.world.get_resource::<UiSurface>().unwrap();
+        for (entity, &node) in ui_surface.entity_to_taffy.iter() {
+            assert!(node <= highest_node, "extraneous taffy nodes are being created last known highest: {highest_node:?}, encountered ({entity}): {:?}", node);
+        }
+        instance
+            .world
+            .commands()
+            .entity(instance.initial.ui_right_1)
+            .insert(TargetCamera(instance.initial.cameras.left));
+
+        ui_schedule.run(instance.world);
+        let ui_surface = instance.world.get_resource::<UiSurface>().unwrap();
+        for (entity, &node) in ui_surface.entity_to_taffy.iter() {
+            assert!(node <= highest_node, "extraneous taffy nodes are being created last known highest: {highest_node:?}, encountered ({entity}): {:?}", node);
         }
     }
 }

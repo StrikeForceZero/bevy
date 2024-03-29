@@ -58,6 +58,7 @@ use bevy_transform::TransformSystem;
 use stack::ui_stack_system;
 pub use stack::UiStack;
 use update::{update_clipping_system, update_target_camera_system};
+use crate::ui_surface::UiSurface;
 
 /// The basic plugin for Bevy UI
 #[derive(Default)]
