@@ -175,6 +175,21 @@ impl UiSurface {
         }
     }
 
+    pub(super) fn promote_ui_node(&mut self, target_entity: &Entity) {
+        self.ui_root_node_meta.entry(*target_entity)
+            .or_insert_with(|| {
+                let user_root_node = *self.entity_to_taffy.get(target_entity).unwrap();
+                let implicit_viewport_node = self.taffy.new_with_children(default_viewport_style(), &[user_root_node]).unwrap();
+                UiNodeMeta {
+                    camera_entity: None,
+                    root_node_pair: RootNodePair {
+                        implicit_viewport_node,
+                        user_root_node,
+                    }
+                }
+            });
+    }
+
     /// Update the children of the taffy node corresponding to the given [`Entity`].
     pub fn update_children(&mut self, entity: Entity, children: &Children) {
         println!("update_children: {entity} children: {children:?}");

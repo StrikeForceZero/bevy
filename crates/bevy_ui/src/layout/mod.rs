@@ -57,6 +57,7 @@ pub enum LayoutError {
 #[derive(SystemParam)]
 pub struct UiLayoutSystemRemovedComponentParam<'w, 's> {
     removed_cameras: RemovedComponents<'w, 's, Camera>,
+    removed_parents: RemovedComponents<'w, 's, Parent>,
     removed_children: RemovedComponents<'w, 's, Children>,
     removed_content_sizes: RemovedComponents<'w, 's, ContentSize>,
     removed_nodes: RemovedComponents<'w, 's, Node>,
@@ -173,6 +174,10 @@ pub fn ui_layout_system(
         if let Some(measure_func) = content_size.measure_func.take() {
             ui_surface.try_update_measure(entity, measure_func);
         }
+    }
+
+    for entity in removed_components.removed_parents.read() {
+        ui_surface.promote_ui_node(&entity);
     }
 
     // clean up removed nodes
@@ -583,6 +588,33 @@ mod tests {
         let taffy_parent = ui_surface.entity_to_taffy.get(&ui_entity1).unwrap();
         let taffy_child = ui_surface.entity_to_taffy.get(&ui_entity2).unwrap();
         assert_eq!(ui_surface.taffy.parent(*taffy_child).unwrap(), *taffy_parent);
+    }
+
+    #[test]
+    fn ui_promotion_from_child_to_root() {
+        let (mut world, mut ui_schedule) = setup_ui_test_world();
+
+        let ui_entity1 = world.spawn(NodeBundle::default()).id();
+        let ui_entity2 = world.spawn(NodeBundle::default()).id();
+        world.commands().entity(ui_entity1).add_child(ui_entity2);
+
+        ui_schedule.run(&mut world);
+
+        let ui_surface = world.resource::<UiSurface>();
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity1));
+        assert!(!ui_surface.ui_root_node_meta.contains_key(&ui_entity2));
+        assert_eq!(ui_surface.taffy.total_node_count(), 3);
+
+        world.commands().entity(ui_entity2).remove_parent();
+
+        ui_schedule.run(&mut world);
+
+        let ui_surface = world.resource::<UiSurface>();
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity1));
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity2));
+        assert_eq!(ui_surface.taffy.total_node_count(), 4);
+        let taffy_child = ui_surface.entity_to_taffy.get(&ui_entity2).unwrap();
+        assert_eq!(ui_surface.taffy.parent(*taffy_child), None);
     }
 
     #[test]
