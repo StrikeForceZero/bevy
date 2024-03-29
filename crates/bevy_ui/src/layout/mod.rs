@@ -22,6 +22,7 @@ use bevy_utils::{HashMap, HashSet};
 use bevy_window::{PrimaryWindow, Window, WindowScaleFactorChanged};
 use thiserror::Error;
 use bevy_ecs::entity::EntityHashSet;
+use bevy_ecs::prelude::Added;
 use bevy_ecs::query::Has;
 use crate::debug::print_ui_layout_tree;
 
@@ -76,6 +77,7 @@ pub fn ui_layout_system(
     style_query: Query<(Entity, Ref<Style>, Option<&TargetCamera>, Has<Parent>), With<Node>>,
     mut measure_query: Query<(Entity, &mut ContentSize)>,
     children_query: Query<(Entity, Ref<Children>), With<Node>>,
+    demote_to_child_query: Query<(Entity, Ref<Parent>), (With<Node>, Added<Parent>)>,
     just_children_query: Query<&Children>,
     mut removed_components: UiLayoutSystemRemovedComponentParam,
     mut node_transform_query: Query<(&mut Node, &mut Transform)>,
@@ -197,6 +199,11 @@ pub fn ui_layout_system(
     for (entity, children) in &children_query {
         if children.is_changed() {
             ui_surface.update_children(entity, &children);
+        }
+    }
+    for (entity, parent) in &demote_to_child_query {
+        if parent.is_added() {
+            ui_surface.demote_ui_node(&entity, &parent.get());
         }
     }
 
@@ -463,7 +470,7 @@ mod tests {
             assert_eq!(layout.size.height, WINDOW_HEIGHT);
         }
     }
-    
+
     fn _track_ui_entity_setup(world: &mut World, ui_schedule: &mut Schedule) -> (Entity, Entity) {
         ui_schedule.run(world);
 
@@ -499,12 +506,12 @@ mod tests {
 
         (ui_entity, child_entity)
     }
-   
+
     #[test]
     fn ui_surface_tracks_ui_entities_despawn() {
         let (mut world, mut ui_schedule) = setup_ui_test_world();
         let (ui_entity, child_entity) = _track_ui_entity_setup(&mut world, &mut ui_schedule);
-        
+
         world.despawn(ui_entity);
 
         // `ui_layout_system` should remove `ui_entity` from `UiSurface::entity_to_taffy`
@@ -538,7 +545,7 @@ mod tests {
     fn ui_surface_tracks_ui_entities_despawn_descendants() {
         let (mut world, mut ui_schedule) = setup_ui_test_world();
         let (ui_entity, child_entity) = _track_ui_entity_setup(&mut world, &mut ui_schedule);
-        
+
         world.commands().entity(ui_entity).despawn_descendants();
 
         // `ui_layout_system` should remove `child_entity` from `UiSurface::entity_to_taffy`
@@ -549,6 +556,33 @@ mod tests {
         assert_eq!(ui_surface.entity_to_taffy.len(), 1);
         assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity));
         assert_eq!(ui_surface.ui_root_node_meta.len(), 1);
+    }
+
+    #[test]
+    fn ui_demotion_from_root_to_child() {
+        let (mut world, mut ui_schedule) = setup_ui_test_world();
+
+        let ui_entity1 = world.spawn(NodeBundle::default()).id();
+        let ui_entity2 = world.spawn(NodeBundle::default()).id();
+
+        ui_schedule.run(&mut world);
+
+        let ui_surface = world.resource::<UiSurface>();
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity1));
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity2));
+        assert_eq!(ui_surface.taffy.total_node_count(), 4);
+
+        world.commands().entity(ui_entity1).add_child(ui_entity2);
+
+        ui_schedule.run(&mut world);
+
+        let ui_surface = world.resource::<UiSurface>();
+        assert!(ui_surface.ui_root_node_meta.contains_key(&ui_entity1));
+        assert!(!ui_surface.ui_root_node_meta.contains_key(&ui_entity2));
+        assert_eq!(ui_surface.taffy.total_node_count(), 3);
+        let taffy_parent = ui_surface.entity_to_taffy.get(&ui_entity1).unwrap();
+        let taffy_child = ui_surface.entity_to_taffy.get(&ui_entity2).unwrap();
+        assert_eq!(ui_surface.taffy.parent(*taffy_child).unwrap(), *taffy_parent);
     }
 
     #[test]

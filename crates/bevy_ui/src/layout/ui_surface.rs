@@ -161,6 +161,19 @@ impl UiSurface {
 
         self.taffy.set_measure(taffy_node, Some(measure_func)).ok()
     }
+    
+    pub(super) fn demote_ui_node(&mut self, target_entity: &Entity, parent_entity: &Entity) {
+        if let Some(mut ui_meta) = self.ui_root_node_meta.remove(target_entity) {
+            if let Some(camera_entity) = ui_meta.camera_entity.take() {
+                if let Some(ui_set) = self.camera_root_nodes.get_mut(&camera_entity) {
+                    ui_set.remove(target_entity);
+                }
+            }
+            self.taffy.remove(ui_meta.root_node_pair.implicit_viewport_node).unwrap();
+            let parent_taffy = self.entity_to_taffy.get(parent_entity).unwrap();
+            self.taffy.add_child(*parent_taffy, ui_meta.root_node_pair.user_root_node).unwrap();
+        }
+    }
 
     /// Update the children of the taffy node corresponding to the given [`Entity`].
     pub fn update_children(&mut self, entity: Entity, children: &Children) {
