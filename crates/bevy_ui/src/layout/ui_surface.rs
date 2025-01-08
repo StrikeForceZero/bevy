@@ -157,9 +157,7 @@ impl UiSurface {
                 self.entity_to_taffy
                     .get(&child)
                     .cloned()
-                    .unwrap_or_else(|| {
-                        panic!("failed to resolve taffy id for child entity {child} in {entity}")
-                    })
+                    .expect("failed to resolve taffy id for child entity {child} in {entity}")
             })
             .collect::<Vec<_>>();
 
